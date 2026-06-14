@@ -57,13 +57,13 @@ then
 	echo -e "No default configuration-file found, exiting..."
 	exit -1
 fi
-if [  ! -x "${F2B_HOME}/usr/bin/fail2ban-client" ]
-then 
+if [  ! -x "${F2B_HOME}/bin/fail2ban-client" ]
+then
 	echo -e "fail2ban executable not found, exiting..."
 	exit -1
 fi
-if [  ! -x "${F2B_HOME}/etc/rc.d/rc.fail2ban" ]
-then 
+if [  ! -x "${F2B_HOME}/bin/rc.fail2ban" ]
+then
 	echo -e "rc.fail2ban not found, exiting..."
 	exit -1
 fi
@@ -183,15 +183,15 @@ done
 echo -e "${CLEAR}"
 if [ $BOOT == "y" ]
 then
-	${F2B_HOME}/etc/rc.d/rc.fail2ban boot_on >/dev/null 2>&1
+	${F2B_HOME}/bin/rc.fail2ban boot_on >/dev/null 2>&1
 else
-	${F2B_HOME}/etc/rc.d/rc.fail2ban boot_off >/dev/null 2>&1
+	${F2B_HOME}/bin/rc.fail2ban boot_off >/dev/null 2>&1
 fi
 #
 # restart fail2ban
 #
-${F2B_HOME}/etc/rc.d/rc.fail2ban stop >/dev/null 2>&1
-${F2B_HOME}/etc/rc.d/rc.fail2ban start
+${F2B_HOME}/bin/rc.fail2ban stop >/dev/null 2>&1
+${F2B_HOME}/bin/rc.fail2ban start
 #
 # finished
 #

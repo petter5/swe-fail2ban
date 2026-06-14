@@ -1,6 +1,6 @@
 MOD_NAME=fail2ban
 MOD_VERSION=0.0.3
-MOD_LONG_NAME="[3.1] ${MOD_NAME} "
+MOD_LONG_NAME="[3.1] fail2ban"
 MOD_INFO="Protect your admin interface from brute forcing."
 MOD_DIR=/var/smoothwall/mods/fail2ban
 MOD_AUTHOR=dataking

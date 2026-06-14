@@ -15,12 +15,16 @@
 #
 
 F2B_HOME="/var/smoothwall/mods-available/fail2ban"
-# Check that config is done
+# Check that config is done (config file is written by config_fail2ban)
 [ -f "${F2B_HOME}/config" ] || exit 0
 
-FAIL2BAN="${F2B_HOME}/usr/bin/fail2ban"
+# fail2ban 0.10.x uses separate server and client binaries.
+# Set PYTHONPATH so the bundled library is found when called from init scripts.
+export PYTHONPATH="${F2B_HOME}/lib/python2.7${PYTHONPATH:+:$PYTHONPATH}"
+FAIL2BAN_CLIENT="${F2B_HOME}/bin/fail2ban-client"
+F2B_CONF="/etc/fail2ban"
 PIDFILE="/var/run/fail2ban.pid"
-CONF="${F2B_HOME}/config"
+SOCKET="/var/run/fail2ban.sock"
 
 RED="\\033[0;31m"
 DGREE="\\033[0;32m"
@@ -41,11 +45,11 @@ RETVAL=0
 
 start() {
     if [ -f "${PIDFILE}" ]; then
-	echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${LRED}fail2ban seems to be running.${CLEAR}\nif not, use \n\t\t$0 force_start\nto run fail2ban"	
+	echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${LRED}fail2ban seems to be running.${CLEAR}\nif not, use \n\t\t$0 force_start\nto run fail2ban"
 	exit -1
     fi
     echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${CLEAR}Starting fail2ban: \c"
-    $FAIL2BAN -c $CONF > /dev/null
+    python "${FAIL2BAN_CLIENT}" -c "${F2B_CONF}" -s "${SOCKET}" -p "${PIDFILE}" start > /dev/null
     RETVAL=$?
     if [ $RETVAL -ne 0 ]
     then
@@ -59,10 +63,10 @@ start() {
 force_start() {
     if [ -f "${PIDFILE}" ]; then
 	rm -f $PIDFILE
-	killall -9 fail2ban >/dev/null 2>&1
+	killall -9 fail2ban-server >/dev/null 2>&1
     fi
     echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${CLEAR}Starting fail2ban: \c"
-    $FAIL2BAN -c $CONF > /dev/null
+    python "${FAIL2BAN_CLIENT}" -c "${F2B_CONF}" -s "${SOCKET}" -p "${PIDFILE}" start > /dev/null
     RETVAL=$?
     if [ $RETVAL -ne 0 ]
     then
@@ -76,7 +80,7 @@ force_start() {
 stop() {
     if [ -f "${PIDFILE}" ]; then
 	echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${CLEAR}Stopping fail2ban: \c"
-	"${FAIL2BAN}" -k > /dev/null
+	python "${FAIL2BAN_CLIENT}" -s "${SOCKET}" stop > /dev/null
     	RETVAL=$?
 	if [ $RETVAL -ne 0 ]
     	then
@@ -88,7 +92,7 @@ stop() {
 }
 
 force_stop() {
-	PID=`ps -A|grep fail2ban|grep -v "rc.fail2ban"|awk '{print $1}'`
+	PID=`ps -A|grep fail2ban-server|grep -v "rc.fail2ban"|awk '{print $1}'`
 	if [ "$PID" != "" ]
 	then
 		echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${CLEAR}Stopping fail2ban: \c"
@@ -121,7 +125,7 @@ clean() {
 }
 
 status(){
-	PID=`ps -A|grep fail2ban|grep -v "rc.fail2ban"|awk '{print $1}'`
+	PID=`ps -A|grep fail2ban-server|grep -v "rc.fail2ban"|awk '{print $1}'`
 	if [ "x$PID" != "x" ]
 	then
 		echo -e "${LRED}-=-${LGREE}=-=${LRED}-=>  ${LGREE}fail2ban is running with pid:${CLEAR} ${LYELL}$PID${CLEAR}"

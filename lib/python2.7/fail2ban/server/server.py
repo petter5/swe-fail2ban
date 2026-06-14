@@ -659,6 +659,10 @@ class Server:
 		if not self.__db and filename.lower() == 'none':
 			return
 		if len(self.__jails) != 0:
+			# During reload jails remain present while config is replayed.
+			# Skip instead of crashing; the DB path does not change on reload.
+			if self.__reload_state:
+				return
 			raise RuntimeError(
 				"Cannot change database when there are jails present")
 		if filename.lower() == "none":
