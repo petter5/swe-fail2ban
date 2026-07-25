@@ -25,6 +25,11 @@ FAIL2BAN_CLIENT="${F2B_HOME}/bin/fail2ban-client"
 F2B_CONF="/etc/fail2ban"
 PIDFILE="/var/run/fail2ban.pid"
 SOCKET="/var/run/fail2ban.sock"
+# Must match "dbfile" in etc/fail2ban/fail2ban.conf. Fail2Ban's sqlite3.connect()
+# does not create missing parent directories, so if this is absent the server
+# silently starts with no persistent ban database and bans do not survive a restart.
+F2B_DB_DIR="${F2B_HOME}/var/lib/fail2ban"
+[ -d "${F2B_DB_DIR}" ] || mkdir -p "${F2B_DB_DIR}"
 
 RED="\\033[0;31m"
 DGREE="\\033[0;32m"

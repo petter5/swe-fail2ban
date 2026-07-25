@@ -57,7 +57,7 @@ class BanManager:
 		## Total number of banned IP address
 		self.__banTotal = 0
 		## The time for next unban process (for performance and load reasons):
-		self.__nextUnbanTime = BanTicket.MAX_TIME
+		self._nextUnbanTime = BanTicket.MAX_TIME
 	
 	##
 	# Set the ban time.
@@ -66,7 +66,6 @@ class BanManager:
 	# @param value the time
 	
 	def setBanTime(self, value):
-		with self.__lock:
 			self.__banTime = int(value)
 	
 	##
@@ -76,7 +75,6 @@ class BanManager:
 	# @return the time
 	
 	def getBanTime(self):
-		with self.__lock:
 			return self.__banTime
 	
 	##
@@ -85,7 +83,6 @@ class BanManager:
 	# @param value total number
 	
 	def setBanTotal(self, value):
-		with self.__lock:
 			self.__banTotal = value
 	
 	##
@@ -94,7 +91,6 @@ class BanManager:
 	# @return the total number
 	
 	def getBanTotal(self):
-		with self.__lock:
 			return self.__banTotal
 
 	##
@@ -102,9 +98,22 @@ class BanManager:
 	#
 	# @return IP list
 	
-	def getBanList(self):
+	def getBanList(self, ordered=False, withTime=False):
+		if not ordered:
+			return list(self.__banList.keys())
 		with self.__lock:
-			return self.__banList.keys()
+			lst = []
+			for ticket in self.__banList.itervalues():
+				eob = ticket.getEndOfBanTime(self.__banTime)
+				lst.append((ticket,eob))
+		lst.sort(key=lambda t: t[1])
+		t2s = MyTime.time2str
+		if withTime:
+			return ['%s \t%s + %d = %s' % (
+					t[0].getID(), 
+					t2s(t[0].getTime()), t[0].getBanTime(self.__banTime), t2s(t[1])
+				) for t in lst]
+		return [t[0].getID() for t in lst]
 
 	##
 	# Returns a iterator to ban list (used in reload, so idle).
@@ -112,8 +121,8 @@ class BanManager:
 	# @return ban list iterator
 	
 	def __iter__(self):
-		with self.__lock:
-			return self.__banList.itervalues()
+		# ensure iterator is safe - traverse over the list in snapshot created within lock (GIL):
+			return iter(list(self.__banList.values()))
 
 	##
 	# Returns normalized value
@@ -156,7 +165,7 @@ class BanManager:
 		# get cymru info:
 		try:
 			for ip in banIPs:
-				# Reference: http://www.team-cymru.org/Services/ip-to-asn.html#dns
+				# Reference: https://www.team-cymru.com/IP-ASN-mapping.html#dns
 				question = ip.getPTR(
 					"origin.asn.cymru.com" if ip.isIPv4
 					else "origin6.asn.cymru.com"
@@ -166,15 +175,21 @@ class BanManager:
 					answers = resolver.query(question, "TXT")
 					if not answers:
 						raise ValueError("No data retrieved")
+					asns = set()
+					countries = set()
+					rirs = set()
 					for rdata in answers:
 						asn, net, country, rir, changed =\
 							[answer.strip("'\" ") for answer in rdata.to_text().split("|")]
 						asn = self.handleBlankResult(asn)
 						country = self.handleBlankResult(country)
 						rir = self.handleBlankResult(rir)
-						return_dict["asn"].append(self.handleBlankResult(asn))
-						return_dict["country"].append(self.handleBlankResult(country))
-						return_dict["rir"].append(self.handleBlankResult(rir))
+						asns.add(self.handleBlankResult(asn))
+						countries.add(self.handleBlankResult(country))
+						rirs.add(self.handleBlankResult(rir))
+					return_dict["asn"].append(', '.join(sorted(asns)))
+					return_dict["country"].append(', '.join(sorted(countries)))
+					return_dict["rir"].append(', '.join(sorted(rirs)))
 				except dns.resolver.NXDOMAIN:
 					return_dict["asn"].append("nxdomain")
 					return_dict["country"].append("nxdomain")
@@ -244,21 +259,6 @@ class BanManager:
 			return []
 
 	##
-	# Create a ban ticket.
-	#
-	# Create a BanTicket from a FailTicket. The timestamp of the BanTicket
-	# is the current time. This is a static method.
-	# @param ticket the FailTicket
-	# @return a BanTicket
-	
-	@staticmethod
-	def createBanTicket(ticket):
-		# we should always use correct time to calculate correct end time (ban time is variable now, 
-		# + possible double banning by restore from database and from log file)
-		# so use as lastTime always time from ticket.
-		return BanTicket(ticket=ticket)
-	
-	##
 	# Add a ban ticket.
 	#
 	# Add a BanTicket instance into the ban list.
@@ -267,6 +267,9 @@ class BanManager:
 	
 	def addBanTicket(self, ticket, reason={}):
 		eob = ticket.getEndOfBanTime(self.__banTime)
+		if eob < MyTime.time():
+			reason['expired'] = 1
+			return False
 		with self.__lock:
 			# check already banned
 			fid = ticket.getID()
@@ -288,9 +291,10 @@ class BanManager:
 			# not yet banned - add new one:
 			self.__banList[fid] = ticket
 			self.__banTotal += 1
+			ticket.incrBanCount()
 			# correct next unban time:
-			if self.__nextUnbanTime > eob:
-				self.__nextUnbanTime = eob
+			if self._nextUnbanTime > eob:
+				self._nextUnbanTime = eob
 			return True
 
 	##
@@ -319,27 +323,28 @@ class BanManager:
 	# @param time the time
 	# @return the list of ticket to unban
 	
-	def unBanList(self, time):
+	def unBanList(self, time, maxCount=0x7fffffff):
 		with self.__lock:
-			# Permanent banning
-			if self.__banTime < 0:
-				return list()
-
 			# Check next unban time:
-			if self.__nextUnbanTime > time:
+			nextUnbanTime = self._nextUnbanTime
+			if nextUnbanTime > time:
 				return list()
 
 			# Gets the list of ticket to remove (thereby correct next unban time).
 			unBanList = {}
-			self.__nextUnbanTime = BanTicket.MAX_TIME
+			nextUnbanTime = BanTicket.MAX_TIME
 			for fid,ticket in self.__banList.iteritems():
 				# current time greater as end of ban - timed out:
 				eob = ticket.getEndOfBanTime(self.__banTime)
 				if time > eob:
 					unBanList[fid] = ticket
-				elif self.__nextUnbanTime > eob:
-					self.__nextUnbanTime = eob
+					if len(unBanList) >= maxCount: # stop search cycle, so reset back the next check time
+						nextUnbanTime = self._nextUnbanTime
+						break
+				elif nextUnbanTime > eob:
+					nextUnbanTime = eob
 
+			self._nextUnbanTime = nextUnbanTime
 			# Removes tickets.
 			if len(unBanList):
 				if len(unBanList) / 2.0 <= len(self.__banList) / 3.0:

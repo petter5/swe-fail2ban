@@ -23,7 +23,6 @@ __copyright__ = "Copyright (c) 2013 Steven Hiscocks"
 __license__ = "GPL"
 
 import datetime
-import fileinput
 import inspect
 import json
 import os
@@ -32,16 +31,19 @@ import sys
 import time
 import unittest
 from ..server.failregex import Regex
-from ..server.filter import Filter
+from ..server.filter import Filter, FileContainer
 from ..client.filterreader import FilterReader
-from .utils import setUpMyTime, tearDownMyTime, CONFIG_DIR
+from .utils import setUpMyTime, tearDownMyTime, TEST_NOW, CONFIG_DIR
+
+# test-time in UTC as string in isoformat (2005-08-14T10:00:00):
+TEST_NOW_STR = datetime.datetime.utcfromtimestamp(TEST_NOW).isoformat()
 
 TEST_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "config")
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
 
 # regexp to test greedy catch-all should be not-greedy:
-RE_HOST = Regex('<HOST>').getRegex()
-RE_WRONG_GREED = re.compile(r'\.[+\*](?!\?).*' + re.escape(RE_HOST) + r'.*(?:\.[+\*].*|[^\$])$')
+RE_HOST = Regex._resolveHostTag('<HOST>')
+RE_WRONG_GREED = re.compile(r'\.[+\*](?!\?)[^\$\^]*' + re.escape(RE_HOST) + r'.*(?:\.[+\*].*|[^\$])$')
 
 
 class FilterSamplesRegex(unittest.TestCase):
@@ -49,16 +51,13 @@ class FilterSamplesRegex(unittest.TestCase):
 	def setUp(self):
 		"""Call before every test case."""
 		super(FilterSamplesRegex, self).setUp()
-		self.filter = Filter(None)
-		self.filter.returnRawHost = True
-		self.filter.checkAllRegex = True
-		self.filter.checkFindTime = False
-		self.filter.active = True
-
+		self._filters = dict()
+		self._filterTests = None
 		setUpMyTime()
 
 	def tearDown(self):
 		"""Call after every test case."""
+		super(FilterSamplesRegex, self).tearDown()
 		tearDownMyTime()
 
 	def testFiltersPresent(self):
@@ -83,11 +82,21 @@ class FilterSamplesRegex(unittest.TestCase):
 			RE_WRONG_GREED.search('non-greedy .+? test' + RE_HOST + ' test vary catch-all .* anchored$'))
 
 
-def testSampleRegexsFactory(name, basedir):
-	def testFilter(self):
-
-		# Check filter exists
-		filterConf = FilterReader(name, "jail", {}, 
+	def _readFilter(self, fltName, name, basedir, opts=None):
+		# Check filter with this option combination was already used:
+		flt = self._filters.get(fltName)
+		if flt:
+			return flt
+		# First time:
+		flt = Filter(None)
+		flt.returnRawHost = True
+		flt.checkAllRegex = True
+		flt.checkFindTime = False
+		flt.active = True
+		# Read filter:
+		if opts is None: opts = dict()
+		opts = opts.copy()
+		filterConf = FilterReader(name, "jail", opts,
 			basedir=basedir, share_config=unittest.F2B.share_config)
 		self.assertEqual(filterConf.getFile(), name)
 		self.assertEqual(filterConf.getJailName(), "jail")
@@ -99,96 +108,211 @@ def testSampleRegexsFactory(name, basedir):
 				optval = opt[3]
 			elif opt[0] == 'set':
 				optval = [opt[3]]
-			else:
-				continue
+			else: # pragma: no cover - unexpected
+				self.fail('Unexpected config-token %r in stream' % (opt,))
 			for optval in optval:
-				if opt[2] == "addfailregex":
-					self.filter.addFailRegex(optval)
+				if opt[2] == "prefregex":
+					flt.prefRegex = optval
+				elif opt[2] == "addfailregex":
+					flt.addFailRegex(optval)
 				elif opt[2] == "addignoreregex":
-					self.filter.addIgnoreRegex(optval)
+					flt.addIgnoreRegex(optval)
 				elif opt[2] == "maxlines":
-					self.filter.setMaxLines(optval)
+					flt.setMaxLines(optval)
 				elif opt[2] == "datepattern":
-					self.filter.setDatePattern(optval)
+					flt.setDatePattern(optval)
+
+		# test regexp contains greedy catch-all before <HOST>, that is
+		# not hard-anchored at end or has not precise sub expression after <HOST>:
+		regexList = flt.getFailRegex()
+		for fr in regexList:
+			if RE_WRONG_GREED.search(fr): # pragma: no cover
+				raise AssertionError("Following regexp of \"%s\" contains greedy catch-all before <HOST>, "
+					"that is not hard-anchored at end or has not precise sub expression after <HOST>:\n%s" %
+					(fltName, str(fr).replace(RE_HOST, '<HOST>')))
+		# Cache within used filter combinations and return:
+		flt = [flt, set()]
+		self._filters[fltName] = flt
+		return flt
+
+	@staticmethod
+	def _filterOptions(opts):
+				return dict((k, v) for k, v in opts.iteritems() if not k.startswith('test.'))
+		
+def testSampleRegexsFactory(name, basedir):
+	def testFilter(self):
 
 		self.assertTrue(
 			os.path.isfile(os.path.join(TEST_FILES_DIR, "logs", name)),
 			"No sample log file available for '%s' filter" % name)
-
-		regexsUsed = set()
+		
 		filenames = [name]
+		regexsUsedRe = set()
+
+		# process each test-file (note: array filenames can grow during processing):
+		commonOpts = {}
+		faildata = {}
 		i = 0
 		while i < len(filenames):
 			filename = filenames[i]; i += 1;
-			logFile = fileinput.FileInput(os.path.join(TEST_FILES_DIR, "logs",
-				filename))
+			logFile = FileContainer(os.path.join(TEST_FILES_DIR, "logs",
+				filename), 'UTF-8', doOpen=True)
+			# avoid errors if no NL char at end of test log-file:
+			logFile.waitForLineEnd = False
 
-			# test regexp contains greedy catch-all before <HOST>, that is
-			# not hard-anchored at end or has not precise sub expression after <HOST>:
-			for fr in self.filter.getFailRegex():
-				if RE_WRONG_GREED.search(fr): #pragma: no cover
-					raise AssertionError("Following regexp of \"%s\" contains greedy catch-all before <HOST>, "
-						"that is not hard-anchored at end or has not precise sub expression after <HOST>:\n%s" %
-						(name, str(fr).replace(RE_HOST, '<HOST>')))
-
+			ignoreBlock = False
+			lnnum = 0
 			for line in logFile:
-				jsonREMatch = re.match("^# ?(failJSON|addFILE):(.+)$", line)
+				lnnum += 1
+				jsonREMatch = re.match("^#+ ?(failJSON|(?:file|filter)Options|addFILE):(.+)$", line)
 				if jsonREMatch:
 					try:
 						faildata = json.loads(jsonREMatch.group(2))
+						# fileOptions - dict in JSON to control common test-file filter options:
+						if jsonREMatch.group(1) == 'fileOptions':
+							commonOpts = faildata
+							continue
+						# filterOptions - dict in JSON to control filter options (e. g. mode, etc.):
+						if jsonREMatch.group(1) == 'filterOptions':
+							# following lines with another filter options:
+							self._filterTests = []
+							ignoreBlock = False
+							for faildata in (faildata if isinstance(faildata, list) else [faildata]):
+								if commonOpts: # merge with common file options:
+									opts = commonOpts.copy()
+									opts.update(faildata)
+								else:
+									opts = faildata
+								# unique filter name (using options combination):
+								self.assertTrue(isinstance(opts, dict))
+								if opts.get('test.condition'):
+									ignoreBlock = not eval(opts.get('test.condition'))
+								if not ignoreBlock:
+									fltOpts = self._filterOptions(opts)
+									fltName = opts.get('test.filter-name')
+									if not fltName: fltName = str(fltOpts) if fltOpts else ''
+									fltName = name + fltName
+									# read it:
+									flt = self._readFilter(fltName, name, basedir, opts=fltOpts)
+									self._filterTests.append((fltName, flt, opts))
+							continue
+						# addFILE - filename to "include" test-files should be additionally parsed:
 						if jsonREMatch.group(1) == 'addFILE':
 							filenames.append(faildata)
 							continue
-					except ValueError as e:
+						# failJSON - faildata contains info of the failure to check it.
+					except ValueError as e: # pragma: no cover - we've valid json's
 						raise ValueError("%s: %s:%i" %
-							(e, logFile.filename(), logFile.filelineno()))
+							(e, logFile.getFileName(), lnnum))
 					line = next(logFile)
-				elif line.startswith("#") or not line.strip():
+				elif ignoreBlock or line.startswith("#") or not line.strip():
 					continue
-				else:
+				else: # pragma: no cover - normally unreachable
 					faildata = {}
+				if ignoreBlock: continue
 
-				ret = self.filter.processLine(line)
-				if not ret:
-					# Check line is flagged as none match
-					self.assertFalse(faildata.get('match', True),
-						 "Line not matched when should have: %s:%i %r" %
-						(logFile.filename(), logFile.filelineno(), line))
-				elif ret:
-					# Check line is flagged to match
-					self.assertTrue(faildata.get('match', False),
-						"Line matched when shouldn't have: %s:%i %r" %
-						(logFile.filename(), logFile.filelineno(), line))
-					self.assertEqual(len(ret), 1, "Multiple regexs matched %r - %s:%i" %
-									 (map(lambda x: x[0], ret),logFile.filename(), logFile.filelineno()))
+				# if filter options was not yet specified:
+				if not self._filterTests:
+					fltName = name
+					flt = self._readFilter(fltName, name, basedir, opts=None)
+					self._filterTests = [(fltName, flt, {})]
 
-					# Verify timestamp and host as expected
-					failregex, host, fail2banTime, lines, fail = ret[0]
-					self.assertEqual(host, faildata.get("host", None))
-
-					t = faildata.get("time", None)
+				line = line.rstrip('\r\n')
+				# process line using several filter options (if specified in the test-file):
+				for fltName, flt, opts in self._filterTests:
+					# Bypass if constraint (as expression) is not valid:
+					if faildata.get('constraint') and not eval(faildata['constraint']):
+						continue
+					flt, regexsUsedIdx = flt
+					regexList = flt.getFailRegex()
+					failregex = -1
 					try:
-						jsonTimeLocal =	datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S")
-					except ValueError:
-						jsonTimeLocal =	datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%f")
+						fail = {}
+						# for logtype "journal" we don't need parse timestamp (simulate real systemd-backend handling):
+						if opts.get('logtype') != 'journal':
+							ret = flt.processLine(line)
+						else: # simulate journal processing, time is known from journal (formatJournalEntry):
+							if opts.get('test.prefix-line'): # journal backends creates common prefix-line:
+								line = opts.get('test.prefix-line') + line
+							ret = flt.processLine(('', TEST_NOW_STR, line), TEST_NOW)
+						if ret:
+							# filter matched only (in checkAllRegex mode it could return 'nofail' too):
+							found = []
+							for ret in ret:
+								failregex, fid, fail2banTime, fail = ret
+								# bypass pending and nofail:
+								if fid is None or fail.get('nofail'):
+									regexsUsedIdx.add(failregex)
+									regexsUsedRe.add(regexList[failregex])
+									continue
+								found.append(ret)
+							ret = found
 
-					jsonTime = time.mktime(jsonTimeLocal.timetuple())
-					
-					jsonTime += jsonTimeLocal.microsecond / 1000000
+						if not ret:
+							# Check line is flagged as none match
+							self.assertFalse(faildata.get('match', False),
+								"Line not matched when should have")
+							continue
 
-					self.assertEqual(fail2banTime, jsonTime,
-						"UTC Time  mismatch fail2ban %s (%s) != failJson %s (%s)  (diff %.3f seconds) on: %s:%i %r:" % 
-						(fail2banTime, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(fail2banTime)),
-						jsonTime, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(jsonTime)),
-						fail2banTime - jsonTime, logFile.filename(), logFile.filelineno(), line ) )
+						# Check line is flagged to match
+						self.assertTrue(faildata.get('match', False), 
+							"Line matched when shouldn't have")
+						self.assertEqual(len(ret), 1,
+							"Multiple regexs matched %r" % (map(lambda x: x[0], ret)))
 
-					regexsUsed.add(failregex)
+						for ret in ret:
+							failregex, fid, fail2banTime, fail = ret
+							# Verify match captures (at least fid/host) and timestamp as expected
+							for k, v in faildata.iteritems():
+								if k not in ("time", "match", "desc", "constraint"):
+									fv = fail.get(k, None)
+									if fv is None:
+										# Fallback for backwards compatibility (previously no fid, was host only):
+										if k == "host":
+											fv = fid
+										# special case for attempts counter:
+										if k == "attempts":
+											fv = len(fail.get('matches', {}))
+									# compare sorted (if set)
+									if isinstance(fv, (set, list, dict)):
+										self.assertSortedEqual(fv, v)
+										continue
+									self.assertEqual(fv, v)
 
-		for failRegexIndex, failRegex in enumerate(self.filter.getFailRegex()):
-			self.assertTrue(
-				failRegexIndex in regexsUsed,
-				"Regex for filter '%s' has no samples: %i: %r" %
-					(name, failRegexIndex, failRegex))
+							t = faildata.get("time", None)
+							if t is not None:
+								try:
+									jsonTimeLocal =	datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S")
+								except ValueError:
+									jsonTimeLocal =	datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%f")
+								jsonTime = time.mktime(jsonTimeLocal.timetuple())
+								jsonTime += jsonTimeLocal.microsecond / 1000000.0
+								self.assertEqual(fail2banTime, jsonTime,
+									"UTC Time  mismatch %s (%s) != %s (%s)  (diff %.3f seconds)" % 
+									(fail2banTime, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(fail2banTime)),
+									jsonTime, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(jsonTime)),
+									fail2banTime - jsonTime) )
+
+							regexsUsedIdx.add(failregex)
+							regexsUsedRe.add(regexList[failregex])
+					except AssertionError as e: # pragma: no cover
+						import pprint
+						raise AssertionError("%s: %s on: %s:%i, line:\n  %s\nregex (%s):\n  %s\n"
+							"faildata: %s\nfail: %s" % (
+								fltName, e, logFile.getFileName(), lnnum, 
+								line, failregex, regexList[failregex] if failregex != -1 else None,
+								'\n'.join(pprint.pformat(faildata).splitlines()),
+								'\n'.join(pprint.pformat(fail).splitlines())))
+
+		# check missing samples for regex using each filter-options combination:
+		for fltName, flt in self._filters.iteritems():
+			flt, regexsUsedIdx = flt
+			regexList = flt.getFailRegex()
+			for failRegexIndex, failRegex in enumerate(regexList):
+				self.assertTrue(
+					failRegexIndex in regexsUsedIdx or failRegex in regexsUsedRe,
+					"%s: Regex has no samples: %i: %r" %
+						(fltName, failRegexIndex, failRegex))
 
 	return testFilter
 

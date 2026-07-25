@@ -28,6 +28,7 @@ import os
 
 from .configreader import DefinitionInitConfigReader
 from ..helpers import getLogger
+from ..server.action import CommandAction
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
@@ -37,19 +38,31 @@ class ActionReader(DefinitionInitConfigReader):
 
 	_configOpts = {
 		"actionstart": ["string", None],
+		"actionstart_on_demand": ["bool", None],
 		"actionstop": ["string", None],
+		"actionflush": ["string", None],
 		"actionreload": ["string", None],
 		"actioncheck": ["string", None],
 		"actionrepair": ["string", None],
+		"actionrepair_on_unban": ["bool", None],
 		"actionban": ["string", None],
+		"actionprolong": ["string", None],
+		"actionreban": ["string", None],
 		"actionunban": ["string", None],
-		"norestored": ["string", None],
+		"norestored": ["bool", None],
 	}
 
 	def __init__(self, file_, jailName, initOpts, **kwargs):
+		# always supply jail name as name parameter if not specified in options:
+		n = initOpts.get("name")
+		if n is None:
+			initOpts["name"] = n = jailName
 		actname = initOpts.get("actname")
 		if actname is None:
 			actname = file_
+			# ensure we've unique action name per jail:
+			if n != jailName:
+				actname += n[len(jailName):] if n.startswith(jailName) else '-' + n
 			initOpts["actname"] = actname
 		self._name = actname
 		DefinitionInitConfigReader.__init__(
@@ -69,21 +82,19 @@ class ActionReader(DefinitionInitConfigReader):
 		return self._name
 
 	def convert(self):
-		opts = self.getCombined(ignore=('timeout', 'bantime'))
-		# type-convert only after combined (otherwise boolean converting prevents substitution):
-		if opts.get('norestored'):
-			opts['norestored'] = self._convert_to_boolean(opts['norestored'])
+		opts = self.getCombined(
+			ignore=CommandAction._escapedTags | set(('timeout', 'bantime')))
 		# stream-convert:
 		head = ["set", self._jailName]
 		stream = list()
 		stream.append(head + ["addaction", self._name])
 		multi = []
 		for opt, optval in opts.iteritems():
-			if opt in self._configOpts:
+			if opt in self._configOpts and not opt.startswith('known/'):
 				multi.append([opt, optval])
 		if self._initOpts:
 			for opt, optval in self._initOpts.iteritems():
-				if opt not in self._configOpts:
+				if opt not in self._configOpts and not opt.startswith('known/'):
 					multi.append([opt, optval])
 		if len(multi) > 1:
 			stream.append(["multi-set", self._jailName, "action", self._name, multi])

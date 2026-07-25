@@ -57,12 +57,7 @@ given ($cwd) {
 			close CONFOUT or die colored("There was a problem closing output tmp file: $!", "bold red");
 			system("/bin/cp -f /tmp/fail2ban.tmp.conf $modsa_home/$mod_name/etc/fail2ban/jail.conf");
 			print colored("Patching /etc/bashrc....\n", "bold cyan");
-			if ( -e "/usr/bin/patch" ) {
-				system("/usr/bin/patch /etc/bashrc < _etc_bashrc.patch");
-			} else {
-				# patch isn't part of a basic SWE, so we have to do this manually
-				system("/bin/cat _etc_bashrc.add >> /etc/bashrc");
-			}
+			system("/bin/grep -q 'modification by swe-fail2ban' /etc/bashrc || /bin/cat _etc_bashrc.add >> /etc/bashrc");
 			chdir("$mods_home");
 			system("/bin/ln -snf ../mods-available/fail2ban fail2ban");
 			# fail2ban insists that stuff be in /etc/fail2ban, even with the alternate config
@@ -103,12 +98,7 @@ given ($cwd) {
 			close CONFOUT or die colored("There was a problem closing output tmp file: $!", "bold red");
 			system("/bin/cp -f /tmp/fail2ban.tmp.conf $modsa_home/$mod_name/etc/fail2ban/jail.conf");
 			print colored("Patching /etc/bashrc....\b", "bold cyan");
-			if ( -e "/usr/bin/patch" ) {
-				system("/usr/bin/patch /etc/bashrc < _etc_bashrc.patch");
-			} else {
-				# patch isn't part of a basic SWE, so we have to do this manually
-				system("/bin/cat _etc_bashrc.add >> /etc/bashrc");
-			}
+			system("/bin/grep -q 'modification by swe-fail2ban' /etc/bashrc || /bin/cat _etc_bashrc.add >> /etc/bashrc");
 			chdir("$mods_home");
 			system("/bin/ln -snf ../mods-available/fail2ban fail2ban");
 			# fail2ban insists that stuff be in /etc/fail2ban, even with the alternate config
@@ -145,12 +135,7 @@ given ($cwd) {
 			close CONFOUT or die colored("There was a problem closing output tmp file: $!", "bold red");
 			system("/bin/cp -f /tmp/fail2ban.tmp.conf $modsa_home/$mod_name/etc/fail2ban/jail.conf");
 			print colored("Patching /etc/bashrc....\b", "bold cyan");
-			if ( -e "/usr/bin/patch" ) {
-				system("/usr/bin/patch /etc/bashrc < _etc_bashrc.patch");
-			} else {
-				# patch isn't part of a basic SWE, so we have to do this manually
-				system("/bin/cat _etc_bashrc.add >> /etc/bashrc");
-			}
+			system("/bin/grep -q 'modification by swe-fail2ban' /etc/bashrc || /bin/cat _etc_bashrc.add >> /etc/bashrc");
 			chdir("$mods_home");
 			system("/bin/ln -snf ../mods-available/fail2ban fail2ban");
 			# fail2ban insists that stuff be in /etc/fail2ban, even with the alternate config

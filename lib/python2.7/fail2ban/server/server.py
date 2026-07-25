@@ -27,18 +27,19 @@ __license__ = "GPL"
 import threading
 from threading import Lock, RLock
 import logging
-import logging.handlers
 import os
 import signal
 import stat
 import sys
 
+from .observer import Observers, ObserverThread
 from .jails import Jails
-from .filter import FileFilter, JournalFilter
+from .filter import DNSUtils, FileFilter, JournalFilter
 from .transmitter import Transmitter
 from .asyncserver import AsyncServer, AsyncServerException
 from .. import version
-from ..helpers import getLogger, str2LogLevel, getVerbosityFormat, excepthook
+from ..helpers import getLogger, _as_bool, extractOptions, str2LogLevel, \
+	getVerbosityFormat, excepthook, prctl_set_th_name
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
@@ -56,6 +57,23 @@ except ImportError: # pragma: no cover
 
 def _thread_name():
 	return threading.current_thread().__class__.__name__
+
+try:
+	FileExistsError
+except NameError: # pragma: 3.x no cover
+	FileExistsError = OSError
+
+def _make_file_path(name):
+	"""Creates path of file (last level only) on demand"""
+	name = os.path.dirname(name)
+	# only if it is absolute (e. g. important for socket, so if unix path):
+	if os.path.isabs(name):
+		# be sure path exists (create last level of directory on demand):
+		try:
+			os.mkdir(name)
+		except (OSError, FileExistsError) as e:
+			if e.errno != 17: # pragma: no cover - not EEXIST is not covered
+				raise
 
 
 class Server:
@@ -94,9 +112,9 @@ class Server:
 		self.__prev_signals[s] = signal.getsignal(s)
 		signal.signal(s, new)
 
-	def start(self, sock, pidfile, force=False, conf={}):
+	def start(self, sock, pidfile, force=False, observer=True, conf={}):
 		# First set the mask to only allow access to owner
-		os.umask(0077)
+		os.umask(0o077)
 		# Second daemonize before logging etc, because it will close all handles:
 		if self.__daemon: # pragma: no cover
 			logSys.info("Starting in daemon mode")
@@ -110,6 +128,9 @@ class Server:
 				logSys.error(err)
 				raise ServerInitializationError(err)
 			# We are daemon.
+
+		# replace main thread (and process) name to identify server (for top/ps/pstree or diagnostic):
+		prctl_set_th_name(conf.get("pname", "fail2ban-server"))
 		
 		# Set all logging parameters (or use default if not specified):
 		self.__verbose = conf.get("verbose", None)
@@ -138,29 +159,45 @@ class Server:
 		# Creates a PID file.
 		try:
 			logSys.debug("Creating PID file %s", pidfile)
+			_make_file_path(pidfile)
 			pidFile = open(pidfile, 'w')
 			pidFile.write("%s\n" % os.getpid())
 			pidFile.close()
 		except (OSError, IOError) as e: # pragma: no cover
 			logSys.error("Unable to create PID file: %s", e)
 		
+		# Create observers and start it:
+		if observer:
+			if Observers.Main is None:
+				Observers.Main = ObserverThread()
+				Observers.Main.start()
+
 		# Start the communication
 		logSys.debug("Starting communication")
 		try:
+			_make_file_path(sock)
 			self.__asyncServer = AsyncServer(self.__transm)
 			self.__asyncServer.onstart = conf.get('onstart')
 			self.__asyncServer.start(sock, force)
 		except AsyncServerException as e:
 			logSys.error("Could not start server: %s", e)
+
+		# Stop (if not yet already executed):
+		self.quit()
+
 		# Removes the PID file.
 		try:
 			logSys.debug("Remove PID file %s", pidfile)
 			os.remove(pidfile)
 		except (OSError, IOError) as e: # pragma: no cover
 			logSys.error("Unable to remove PID file: %s", e)
-		logSys.info("Exiting Fail2ban")
-	
+
 	def quit(self):
+		# Prevent to call quit twice:
+		self.quit = lambda: False
+
+		logSys.info("Shutdown in progress...")
+
 		# Stop communication first because if jail's unban action
 		# tries to communicate via fail2ban-client we get a lockup
 		# among threads.  So the simplest resolution is to stop all
@@ -168,11 +205,26 @@ class Server:
 		# are exiting)
 		# See https://github.com/fail2ban/fail2ban/issues/7
 		if self.__asyncServer is not None:
-			self.__asyncServer.stop()
-			self.__asyncServer = None
+			self.__asyncServer.stop_communication()
+
+		# Restore default signal handlers:
+		if _thread_name() == '_MainThread':
+			for s, sh in self.__prev_signals.iteritems():
+				signal.signal(s, sh)
+
+		# Give observer a small chance to complete its work before exit
+		obsMain = Observers.Main
+		if obsMain is not None:
+			if obsMain.stop(forceQuit=False):
+				obsMain = None
+			Observers.Main = None
 
 		# Now stop all the jails
 		self.stopAllJail()
+
+		# Stop observer ultimately
+		if obsMain is not None:
+			obsMain.stop()
 
 		# Explicit close database (server can leave in a thread, 
 		# so delayed GC can prevent commiting changes)
@@ -180,18 +232,12 @@ class Server:
 			self.__db.close()
 			self.__db = None
 
-		# Only now shutdown the logging.
-		if self.__logTarget is not None:
-			with self.__loggingLock:
-				logging.shutdown()
+		# Stop async and exit
+		if self.__asyncServer is not None:
+			self.__asyncServer.stop()
+			self.__asyncServer = None
+		logSys.info("Exiting Fail2ban")
 
-		# Restore default signal handlers:
-		if _thread_name() == '_MainThread':
-			for s, sh in self.__prev_signals.iteritems():
-				signal.signal(s, sh)
-
-		# Prevent to call quit twice:
-		self.quit = lambda: False
 
 	def addJail(self, name, backend):
 		addflg = True
@@ -247,6 +293,11 @@ class Server:
 			for name in self.__jails.keys():
 				self.delJail(name, stop=False, join=True)
 
+	def clearCaches(self):
+		# we need to clear caches, to be able to recognize new IPs/families etc:
+		DNSUtils.CACHE_nameToIp.clear()
+		DNSUtils.CACHE_ipToName.clear()	
+
 	def reloadJails(self, name, opts, begin):
 		if begin:
 			# begin reload:
@@ -268,6 +319,8 @@ class Server:
 						if "--restart" in opts:
 							self.stopJail(name)
 				else:
+					# invalidate caches by reload
+					self.clearCaches()
 					# first unban all ips (will be not restored after (re)start):
 					if "--unban" in opts:
 						self.setUnbanIP()
@@ -308,6 +361,12 @@ class Server:
 		return self.__jails[name].idle
 	
 	# Filter
+	def setIgnoreSelf(self, name, value):
+		self.__jails[name].filter.ignoreSelf = _as_bool(value)
+	
+	def getIgnoreSelf(self, name):
+		return self.__jails[name].filter.ignoreSelf
+
 	def addIgnoreIP(self, name, ip):
 		self.__jails[name].filter.addIgnoreIP(ip)
 	
@@ -332,7 +391,7 @@ class Server:
 		if isinstance(filter_, FileFilter):
 			return filter_.getLogPaths()
 		else: # pragma: systemd no cover
-			logSys.info("Jail %s is not a FileFilter instance" % name)
+			logSys.debug("Jail %s is not a FileFilter instance" % name)
 			return []
 	
 	def addJournalMatch(self, name, match): # pragma: systemd no cover
@@ -350,7 +409,7 @@ class Server:
 		if isinstance(filter_, JournalFilter):
 			return filter_.getJournalMatch()
 		else:
-			logSys.info("Jail %s is not a JournalFilter instance" % name)
+			logSys.debug("Jail %s is not a JournalFilter instance" % name)
 			return []
 	
 	def setLogEncoding(self, name, encoding):
@@ -373,12 +432,33 @@ class Server:
 	def getDatePattern(self, name):
 		return self.__jails[name].filter.getDatePattern()
 
+	def setLogTimeZone(self, name, tz):
+		self.__jails[name].filter.setLogTimeZone(tz)
+
+	def getLogTimeZone(self, name):
+		return self.__jails[name].filter.getLogTimeZone()
+
 	def setIgnoreCommand(self, name, value):
-		self.__jails[name].filter.setIgnoreCommand(value)
+		self.__jails[name].filter.ignoreCommand = value
 
 	def getIgnoreCommand(self, name):
-		return self.__jails[name].filter.getIgnoreCommand()
+		return self.__jails[name].filter.ignoreCommand
 
+	def setIgnoreCache(self, name, value):
+		value, options = extractOptions("cache["+value+"]")
+		self.__jails[name].filter.ignoreCache = options
+
+	def getIgnoreCache(self, name):
+		return self.__jails[name].filter.ignoreCache
+
+	def setPrefRegex(self, name, value):
+		flt = self.__jails[name].filter
+		logSys.debug("  prefregex: %r", value)
+		flt.prefRegex = value
+
+	def getPrefRegex(self, name):
+		return self.__jails[name].filter.prefRegex
+	
 	def addFailRegex(self, name, value, multiple=False):
 		flt = self.__jails[name].filter
 		if not multiple: value = (value,)
@@ -411,6 +491,12 @@ class Server:
 	def getUseDns(self, name):
 		return self.__jails[name].filter.getUseDns()
 	
+	def setMaxMatches(self, name, value):
+		self.__jails[name].filter.failManager.maxMatches = value
+	
+	def getMaxMatches(self, name):
+		return self.__jails[name].filter.failManager.maxMatches
+	
 	def setMaxRetry(self, name, value):
 		self.__jails[name].filter.setMaxRetry(value)
 	
@@ -441,26 +527,75 @@ class Server:
 	def setBanTime(self, name, value):
 		self.__jails[name].actions.setBanTime(value)
 	
+	def addAttemptIP(self, name, *args):
+		return self.__jails[name].filter.addAttempt(*args)
+
 	def setBanIP(self, name, value):
-		return self.__jails[name].filter.addBannedIP(value)
-		
-	def setUnbanIP(self, name=None, value=None):
+		return self.__jails[name].actions.addBannedIP(value)
+
+	def setUnbanIP(self, name=None, value=None, ifexists=True):
 		if name is not None:
-			# in all jails:
+			# single jail:
 			jails = [self.__jails[name]]
 		else:
-			# single jail:
+			# in all jails:
 			jails = self.__jails.values()
 		# unban given or all (if value is None):
 		cnt = 0
+		ifexists |= (name is None)
 		for jail in jails:
-			cnt += jail.actions.removeBannedIP(value, ifexists=(name is None))
-		if value and not cnt:
-			logSys.info("%s is not banned", value)
+			cnt += jail.actions.removeBannedIP(value, ifexists=ifexists)
 		return cnt
+		
+	def banned(self, name=None, ids=None):
+		if name is not None:
+			# single jail:
+			jails = [self.__jails[name]]
+		else:
+			# in all jails:
+			jails = self.__jails.values()
+		# check banned ids:
+		res = []
+		if name is None and ids:
+			for ip in ids:
+				ret = []
+				for jail in jails:
+					if jail.actions.getBanned([ip]):
+						ret.append(jail.name)
+				res.append(ret)
+		else:
+			for jail in jails:
+				ret = jail.actions.getBanned(ids)
+				if name is not None:
+					return ret
+					res.append(ret)
+				else:
+					res.append({jail.name: ret})
+		return res
 		
 	def getBanTime(self, name):
 		return self.__jails[name].actions.getBanTime()
+
+	def getBanList(self, name, withTime=False):
+		"""Returns the list of banned IP addresses for a jail.
+
+		Parameters
+		----------
+		name : str
+			The name of a jail.
+
+		Returns
+		-------
+		list
+			The list of banned IP addresses.
+		"""
+		return self.__jails[name].actions.getBanList(withTime)
+
+	def setBanTimeExtra(self, name, opt, value):
+		self.__jails[name].setBanTimeExtra(opt, value)
+
+	def getBanTimeExtra(self, name, opt):
+		return self.__jails[name].getBanTimeExtra(opt)
 	
 	def isStarted(self):
 		return self.__asyncServer is not None and self.__asyncServer.isActive()
@@ -531,6 +666,7 @@ class Server:
 	
 	def setLogTarget(self, target):
 		# check reserved targets in uppercase, don't change target, because it can be file:
+		target, logOptions = extractOptions(target)
 		systarget = target.upper()
 		with self.__loggingLock:
 			# don't set new handlers if already the same
@@ -540,12 +676,20 @@ class Server:
 			if systarget == "INHERITED":
 				self.__logTarget = target
 				return True
+			padding = logOptions.get('padding')
 			# set a format which is simpler for console use
-			fmt = "%(asctime)s %(name)-24s[%(process)d]: %(levelname)-7s %(message)s"
-			if systarget == "SYSLOG":
-				# Syslog daemons already add date to the message.
-				fmt = "%(name)s[%(process)d]: %(levelname)s %(message)s"
-				facility = logging.handlers.SysLogHandler.LOG_DAEMON
+			if systarget == "SYSTEMD-JOURNAL":
+				from systemd.journal import JournalHandler
+				hdlr = JournalHandler(SYSLOG_IDENTIFIER='fail2ban')
+			elif systarget == "SYSLOG":
+				facility = logOptions.get('facility', 'DAEMON').upper()
+				# backwards compatibility - default no padding for syslog handler:
+				if padding is None: padding = '0'
+				try:
+					facility = getattr(logging.handlers.SysLogHandler, 'LOG_' + facility)
+				except AttributeError: # pragma: no cover
+					logSys.error("Unable to set facility %r, using 'DAEMON'", logOptions.get('facility'))
+					facility = logging.handlers.SysLogHandler.LOG_DAEMON
 				if self.__syslogSocket == "auto":
 					import platform
 					self.__syslogSocket = self.__autoSyslogSocketPaths.get(
@@ -561,7 +705,7 @@ class Server:
 						"Syslog socket file: %s does not exists"
 						" or is not a socket" % self.__syslogSocket)
 					return False
-			elif systarget == "STDOUT":
+			elif systarget in ("STDOUT", "SYSOUT"):
 				hdlr = logging.StreamHandler(sys.stdout)
 			elif systarget == "STDERR":
 				hdlr = logging.StreamHandler(sys.stderr)
@@ -584,21 +728,37 @@ class Server:
 				try:
 					handler.flush()
 					handler.close()
-				except (ValueError, KeyError):  # pragma: no cover
+				except (ValueError, KeyError): # pragma: no cover
 					# Is known to be thrown after logging was shutdown once
 					# with older Pythons -- seems to be safe to ignore there
-					# At least it was still failing on 2.6.2-0ubuntu1 (jaunty)
-					if (2, 6, 3) <= sys.version_info < (3,) or \
-							(3, 2) <= sys.version_info:
+					if sys.version_info < (3,) or sys.version_info >= (3, 2):
 						raise
 			# detailed format by deep log levels (as DEBUG=10):
 			if logger.getEffectiveLevel() <= logging.DEBUG: # pragma: no cover
 				if self.__verbose is None:
 					self.__verbose = logging.DEBUG - logger.getEffectiveLevel() + 1
-			if self.__verbose is not None and self.__verbose > 2: # pragma: no cover
-				fmt = getVerbosityFormat(self.__verbose-1)
+			# If handler don't already add date to the message:
+			addtime = logOptions.get('datetime')
+			if addtime is not None:
+				addtime = _as_bool(addtime)
+			else:
+				addtime = systarget not in ("SYSLOG", "SYSOUT")
+			if padding is not None:
+				padding = _as_bool(padding) 
+			else:
+				padding = True
+			# If log-format is redefined in options:
+			if logOptions.get('format', '') != '':
+				fmt = logOptions.get('format')
+			else:
+				# verbose log-format:
+				verbose = 0
+				if self.__verbose is not None and self.__verbose > 2: # pragma: no cover
+					verbose = self.__verbose-1
+				fmt = getVerbosityFormat(verbose, addtime=addtime, padding=padding)
 			# tell the handler to use this format
-			hdlr.setFormatter(logging.Formatter(fmt))
+			if target != "SYSTEMD-JOURNAL":
+				hdlr.setFormatter(logging.Formatter(fmt))
 			logger.addHandler(hdlr)
 			# Does not display this message at startup.
 			if self.__logTarget is not None:
@@ -624,9 +784,9 @@ class Server:
 			if self.__syslogSocket == syslogsocket:
 				return True
 			self.__syslogSocket = syslogsocket
-			# Conditionally reload, logtarget depends on socket path when SYSLOG
-			return self.__logTarget != "SYSLOG"\
-				   or self.setLogTarget(self.__logTarget)
+		# Conditionally reload, logtarget depends on socket path when SYSLOG
+		return self.__logTarget != "SYSLOG"\
+			   or self.setLogTarget(self.__logTarget)
 
 	def getLogTarget(self):
 		with self.__loggingLock:
@@ -637,7 +797,7 @@ class Server:
 			return self.__syslogSocket
 
 	def flushLogs(self):
-		if self.__logTarget not in ['STDERR', 'STDOUT', 'SYSLOG']:
+		if self.__logTarget not in ['STDERR', 'STDOUT', 'SYSLOG', 'SYSTEMD-JOURNAL']:
 			for handler in getLogger("fail2ban").handlers:
 				try:
 					handler.doRollover()
@@ -652,6 +812,21 @@ class Server:
 				logSys.info("flush performed on %s" % self.__logTarget)
 			return "flushed"
 			
+	@staticmethod
+	def setIPv6IsAllowed(value):
+		value = _as_bool(value) if value != 'auto' else None
+		return DNSUtils.setIPv6IsAllowed(value)
+
+	def setThreadOptions(self, value):
+		for o, v in value.iteritems():
+			if o == 'stacksize':
+				threading.stack_size(int(v)*1024)
+			else: # pragma: no cover
+				raise KeyError("unknown option %r" % o)
+
+	def getThreadOptions(self):
+		return {'stacksize': threading.stack_size() // 1024}
+
 	def setDatabase(self, filename):
 		# if not changed - nothing to do
 		if self.__db and self.__db.filename == filename:
@@ -669,15 +844,38 @@ class Server:
 			self.__db = None
 		else:
 			if Fail2BanDb is not None:
+				_make_file_path(filename)
 				self.__db = Fail2BanDb(filename)
 				self.__db.delAllJails()
 			else: # pragma: no cover
 				logSys.error(
 					"Unable to import fail2ban database module as sqlite "
 					"is not available.")
+		if Observers.Main is not None:
+			Observers.Main.db_set(self.__db)
 	
 	def getDatabase(self):
 		return self.__db
+
+	@staticmethod
+	def __get_fdlist():
+		"""Generate a list of open file descriptors.
+		
+		This wouldn't work on some platforms, or if proc/fdescfs not mounted, or a chroot environment,
+		then it'd raise a FileExistsError.
+		"""
+		for path in (
+			'/proc/self/fd', # Linux, Cygwin and NetBSD
+			'/proc/fd',      # MacOS and FreeBSD
+		):
+			if os.path.exists(path):
+				def fdlist():
+					for name in os.listdir(path):
+						if name.isdigit():
+							yield int(name)
+				return fdlist()
+		# other platform or unmounted, chroot etc:
+		raise FileExistsError("fd-list not found")
 
 	def __createDaemon(self): # pragma: no cover
 		""" Detach a process from the controlling terminal and run it in the
@@ -736,25 +934,37 @@ class Server:
 			# Signal to exit, parent of the first child.
 			return None
 	
-		# Close all open files.  Try the system configuration variable, SC_OPEN_MAX,
+		# Close all open files. Try to obtain the range of open descriptors directly.
+		# As a fallback try the system configuration variable, SC_OPEN_MAX,
 		# for the maximum number of open files to close.  If it doesn't exist, use
 		# the default value (configurable).
 		try:
-			maxfd = os.sysconf("SC_OPEN_MAX")
-		except (AttributeError, ValueError):
-			maxfd = 256	   # default maximum
+			fdlist = self.__get_fdlist()
+			maxfd = -1
+		except:
+			try:
+				maxfd = os.sysconf("SC_OPEN_MAX")
+			except (AttributeError, ValueError):
+				maxfd = 256	   # default maximum
+			fdlist = xrange(maxfd+1)
 	
 		# urandom should not be closed in Python 3.4.0. Fixed in 3.4.1
 		# http://bugs.python.org/issue21207
 		if sys.version_info[0:3] == (3, 4, 0): # pragma: no cover
 			urandom_fd = os.open("/dev/urandom", os.O_RDONLY)
-			for fd in range(0, maxfd):
+			for fd in fdlist:
 				try:
 					if not os.path.sameopenfile(urandom_fd, fd):
 						os.close(fd)
 				except OSError:   # ERROR (ignore)
 					pass
 			os.close(urandom_fd)
+		elif maxfd == -1:
+			for fd in fdlist:
+				try:
+					os.close(fd)
+				except OSError:   # ERROR (ignore)
+					pass
 		else:
 			os.closerange(0, maxfd)
 	

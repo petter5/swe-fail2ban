@@ -26,19 +26,24 @@ __license__ = "GPL"
 
 import unittest
 
+from .utils import setUpMyTime, tearDownMyTime
+
 from ..server.banmanager import BanManager
+from ..server.ipdns import DNSUtils
 from ..server.ticket import BanTicket
 
 class AddFailure(unittest.TestCase):
 	def setUp(self):
 		"""Call before every test case."""
 		super(AddFailure, self).setUp()
+		setUpMyTime()
 		self.__ticket = BanTicket('193.168.0.128', 1167605999.0)
 		self.__banManager = BanManager()
 
 	def tearDown(self):
 		"""Call after every test case."""
-		pass
+		super(AddFailure, self).tearDown()
+		tearDownMyTime()
 
 	def testAdd(self):
 		self.assertTrue(self.__banManager.addBanTicket(self.__ticket))
@@ -93,6 +98,25 @@ class AddFailure(unittest.TestCase):
 		self.assertTrue(self.__banManager.addBanTicket(self.__ticket))
 		ticket = BanTicket('111.111.1.111', 1167605999.0)
 		self.assertFalse(self.__banManager._inBanList(ticket))
+		
+	def testBanTimeIncr(self):
+		ticket = BanTicket(self.__ticket.getID(), self.__ticket.getTime())
+		## increase twice and at end permanent, check time/count increase:
+		c = 0
+		for i in (1000, 2000, -1):
+			self.__banManager.addBanTicket(self.__ticket); c += 1
+			ticket.setBanTime(i)
+			self.assertFalse(self.__banManager.addBanTicket(ticket)); # no incr of c (already banned)
+			self.assertEqual(str(self.__banManager.getTicketByID(ticket.getID())), 
+				"BanTicket: ip=%s time=%s bantime=%s bancount=%s #attempts=0 matches=[]" % (ticket.getID(), ticket.getTime(), i, c))
+		## after permanent, it should remain permanent ban time (-1):
+		self.__banManager.addBanTicket(self.__ticket); c += 1
+		ticket.setBanTime(-1)
+		self.assertFalse(self.__banManager.addBanTicket(ticket)); # no incr of c (already banned)
+		ticket.setBanTime(1000)
+		self.assertFalse(self.__banManager.addBanTicket(ticket)); # no incr of c (already banned)
+		self.assertEqual(str(self.__banManager.getTicketByID(ticket.getID())), 
+			"BanTicket: ip=%s time=%s bantime=%s bancount=%s #attempts=0 matches=[]" % (ticket.getID(), ticket.getTime(), -1, c))
 
 	def testUnban(self):
 		btime = self.__banManager.getBanTime()
@@ -131,23 +155,40 @@ class AddFailure(unittest.TestCase):
 		finally:
 			self.__banManager.setBanTime(btime)
 
+	def testBanList(self):
+		tickets = [
+			BanTicket('192.0.2.1', 1167605999.0),
+			BanTicket('192.0.2.2', 1167605999.0),
+		]
+		tickets[1].setBanTime(-1)
+		for t in tickets:
+			self.__banManager.addBanTicket(t)
+		self.assertSortedEqual(self.__banManager.getBanList(ordered=True, withTime=True),
+			[
+			  '192.0.2.1 \t2006-12-31 23:59:59 + 600 = 2007-01-01 00:09:59',
+			  '192.0.2.2 \t2006-12-31 23:59:59 + -1 = 9999-12-31 23:59:59'
+			]
+		)
+
 
 class StatusExtendedCymruInfo(unittest.TestCase):
 	def setUp(self):
 		"""Call before every test case."""
 		super(StatusExtendedCymruInfo, self).setUp()
 		unittest.F2B.SkipIfNoNetwork()
-		self.__ban_ip = "93.184.216.34"
-		self.__asn = "15133"
-		self.__country = "EU"
-		self.__rir = "ripencc"
+		setUpMyTime()
+		self.__ban_ip = iter(DNSUtils.dnsToIp("resolver1.opendns.com")).next()
+		self.__asn = "36692"
+		self.__country = "US"
+		self.__rir = "arin"
 		ticket = BanTicket(self.__ban_ip, 1167605999.0)
 		self.__banManager = BanManager()
 		self.assertTrue(self.__banManager.addBanTicket(ticket))
 
 	def tearDown(self):
 		"""Call after every test case."""
-		pass
+		super(StatusExtendedCymruInfo, self).tearDown()
+		tearDownMyTime()
 
 	available = True, None
 
@@ -156,7 +197,7 @@ class StatusExtendedCymruInfo(unittest.TestCase):
 		if tc.available[0]:
 			cymru_info = self.__banManager.getBanListExtendedCymruInfo(
 				timeout=(2 if unittest.F2B.fast else 20))
-		else:
+		else: # pragma: no cover - availability (once after error case only)
 			cymru_info = tc.available[1]
 		if cymru_info.get("error"): # pragma: no cover - availability
 			tc.available = False, cymru_info
@@ -198,13 +239,12 @@ class StatusExtendedCymruInfo(unittest.TestCase):
 						   "country": ["nxdomain"],
 						   "rir": ["nxdomain"]})
 
-		# even for private IPs ASNs defined
 		# Since it outputs for all active tickets we would get previous results
 		# and new ones
-		ticket = BanTicket("10.0.0.0", 1167606000.0)
+		ticket = BanTicket("8.0.0.0", 1167606000.0)
 		self.assertTrue(self.__banManager.addBanTicket(ticket))
 		cymru_info = self._getBanListExtendedCymruInfo()
-		self.assertDictEqual(dict((k, sorted(v)) for k, v in cymru_info.iteritems()),
-						  {"asn": sorted(["nxdomain", "4565",]),
-						   "country": sorted(["nxdomain", "unknown"]),
-						   "rir": sorted(["nxdomain", "other"])})
+		self.assertSortedEqual(cymru_info,
+						  {"asn": ["nxdomain", "3356",],
+						   "country": ["nxdomain", "US"],
+						   "rir": ["nxdomain", "arin"]}, level=-1, key=str)

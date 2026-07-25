@@ -22,6 +22,7 @@ __author__ = "Yaroslav Halchenko"
 __copyright__ = "Copyright (c) 2013 Yaroslav Halchenko"
 __license__ = "GPL"
 
+import fileinput
 import itertools
 import logging
 import optparse
@@ -38,7 +39,7 @@ from cStringIO import StringIO
 from functools import wraps
 
 from ..helpers import getLogger, str2LogLevel, getVerbosityFormat, uni_decode
-from ..server.ipdns import DNSUtils
+from ..server.ipdns import IPAddr, DNSUtils
 from ..server.mytime import MyTime
 from ..server.utils import Utils
 # for action_d.test_smtp :
@@ -46,7 +47,7 @@ from ..server import asyncserver
 from ..version import version
 
 
-logSys = getLogger(__name__)
+logSys = getLogger("fail2ban")
 
 TEST_NOW = 1124013600
 
@@ -56,8 +57,11 @@ if not CONFIG_DIR:
 # Use heuristic to figure out where configuration files are
 	if os.path.exists(os.path.join('config','fail2ban.conf')):
 		CONFIG_DIR = 'config'
-	else:
+	else: # pragma: no cover - normally unreachable
 		CONFIG_DIR = '/etc/fail2ban'
+
+# Indicates that we've stock config:
+STOCK = os.path.exists(os.path.join(CONFIG_DIR, 'fail2ban.conf'))
 
 # During the test cases (or setup) use fail2ban modules from main directory:
 os.putenv('PYTHONPATH', os.path.dirname(os.path.dirname(os.path.dirname(
@@ -122,9 +126,6 @@ def getOptParser(doc=""):
 
 def initProcess(opts):
 	# Logger:
-	global logSys
-	logSys = getLogger("fail2ban")
-
 	llev = None
 	if opts.log_level is not None: # pragma: no cover
 		# so we had explicit settings
@@ -177,9 +178,13 @@ def initProcess(opts):
 
 
 class F2B(DefaultTestOptions):
+
+	MAX_WAITTIME = 60
+	MID_WAITTIME = 30
+
 	def __init__(self, opts):
 		self.__dict__ = opts.__dict__
-		if self.fast:
+		if self.fast: # pragma: no cover - normal mode in travis
 			self.memory_db = True
 			self.no_gamin = True
 		self.__dict__['share_config'] = {}
@@ -187,8 +192,37 @@ class F2B(DefaultTestOptions):
 		pass
 	def SkipIfNoNetwork(self):
 		pass
-	def maxWaitTime(self,wtime):
-		if self.fast:
+
+	def SkipIfCfgMissing(self, **kwargs):
+		"""Helper to check action/filter config is available
+		"""
+		if not STOCK: # pragma: no cover
+			if kwargs.get('stock'):
+				raise unittest.SkipTest('Skip test because of missing stock-config files')
+			for t in ('action', 'filter'):
+				v = kwargs.get(t)
+				if v is None: continue
+				if os.path.splitext(v)[1] == '': v += '.conf'
+				if not os.path.exists(os.path.join(CONFIG_DIR, t+'.d', v)):
+					raise unittest.SkipTest('Skip test because of missing %s-config for %r' % (t, v))
+
+	def skip_if_cfg_missing(self, **decargs):
+		"""Helper decorator to check action/filter config is available
+		"""
+		def _deco_wrapper(f):
+			@wraps(f)
+			def wrapper(self, *args, **kwargs):
+				unittest.F2B.SkipIfCfgMissing(**decargs)
+				return f(self, *args, **kwargs)
+			return wrapper
+		return _deco_wrapper
+
+	def maxWaitTime(self, wtime=True):
+		if isinstance(wtime, bool) and wtime:
+			wtime = self.MAX_WAITTIME
+		# short only integer interval (avoid by conditional wait with callable, and dual 
+		# wrapping in some routines, if it will be called twice):
+		if self.fast and isinstance(wtime, int):
 			wtime = float(wtime) / 10
 		return wtime
 
@@ -209,23 +243,17 @@ def with_tmpdir(f):
 			shutil.rmtree(tmp)
 	return wrapper
 
+def with_alt_time(f):
+	"""Helper decorator to execute test in alternate (fixed) test time."""
+	@wraps(f)
+	def wrapper(self, *args, **kwargs):
+		setUpMyTime()
+		try:
+			return f(self, *args, **kwargs)
+		finally:
+			tearDownMyTime()
+	return wrapper
 
-# backwards compatibility to python 2.6:
-if not hasattr(unittest, 'SkipTest'): # pragma: no cover
-	class SkipTest(Exception):
-		pass
-	unittest.SkipTest = SkipTest
-	_org_AddError = unittest._TextTestResult.addError
-	def addError(self, test, err):
-		if err[0] is SkipTest: 
-			if self.showAll:
-				self.stream.writeln(str(err[1]))
-			elif self.dots:
-				self.stream.write('s')
-				self.stream.flush()
-			return
-		_org_AddError(self, test, err)
-	unittest._TextTestResult.addError = addError
 
 def initTests(opts):
 	## if running from installer (setup.py):
@@ -244,15 +272,15 @@ def initTests(opts):
 		unittest.F2B.SkipIfFast = F2B_SkipIfFast
 	else:
 		# smaller inertance inside test-cases (litle speedup):
-		Utils.DEFAULT_SLEEP_TIME = 0.25
-		Utils.DEFAULT_SLEEP_INTERVAL = 0.025
+		Utils.DEFAULT_SLEEP_TIME = 0.025
+		Utils.DEFAULT_SLEEP_INTERVAL = 0.005
 		Utils.DEFAULT_SHORT_INTERVAL = 0.0005
 		# sleep intervals are large - use replacement for sleep to check time to sleep:
 		_org_sleep = time.sleep
 		def _new_sleep(v):
-			if v > max(1, Utils.DEFAULT_SLEEP_TIME): # pragma: no cover
+			if v > 0.25: # pragma: no cover
 				raise ValueError('[BAD-CODE] To long sleep interval: %s, try to use conditional Utils.wait_for instead' % v)
-			_org_sleep(min(v, Utils.DEFAULT_SLEEP_TIME))
+			_org_sleep(v)
 		time.sleep = _new_sleep
 	# --no-network :
 	if unittest.F2B.no_network: # pragma: no cover
@@ -262,27 +290,50 @@ def initTests(opts):
 
 	# persistently set time zone to CET (used in zone-related test-cases),
 	# yoh: we need to adjust TZ to match the one used by Cyril so all the timestamps match
-	os.environ['TZ'] = 'Europe/Zurich'
+	# This offset corresponds to Europe/Zurich timezone.  Specifying it
+	# explicitly allows to avoid requiring tzdata package to be installed during
+	# testing.   See https://bugs.debian.org/855920 for more information
+	os.environ['TZ'] = 'CET-01CEST-02,M3.5.0,M10.5.0'
 	time.tzset()
 	# set alternate now for time related test cases:
 	MyTime.setAlternateNow(TEST_NOW)
 
 	# precache all invalid ip's (TEST-NET-1, ..., TEST-NET-3 according to RFC 5737):
 	c = DNSUtils.CACHE_ipToName
-	for i in xrange(255):
+	c.clear = lambda: logSys.warn('clear CACHE_ipToName is disabled in test suite')
+	# increase max count and max time (too many entries, long time testing):
+	c.setOptions(maxCount=10000, maxTime=5*60)
+	for i in xrange(256):
 		c.set('192.0.2.%s' % i, None)
 		c.set('198.51.100.%s' % i, None)
 		c.set('203.0.113.%s' % i, None)
+		c.set('2001:db8::%s' %i, 'test-host')
+	# some legal ips used in our test cases (prevent slow dns-resolving and failures if will be changed later):
+	c.set('2001:db8::ffff', 'test-other')
+	c.set('87.142.124.10', 'test-host')
 	if unittest.F2B.no_network: # pragma: no cover
-		# precache all wrong dns to ip's used in test cases:
+		# precache all ip to dns used in test cases:
+		c.set('192.0.2.888', None)
+		c.set('8.8.4.4', 'dns.google')
+		c.set('8.8.4.4', 'dns.google')
+		# precache all dns to ip's used in test cases:
 		c = DNSUtils.CACHE_nameToIp
+		c.clear = lambda: logSys.warn('clear CACHE_nameToIp is disabled in test suite')
 		for i in (
-			('999.999.999.999', []),
-			('abcdef.abcdef', []),
-			('192.168.0.', []),
-			('failed.dns.ch', []),
+			('999.999.999.999', set()),
+			('abcdef.abcdef', set()),
+			('192.168.0.', set()),
+			('failed.dns.ch', set()),
+			('doh1.2.3.4.buga.xxxxx.yyy.invalid', set()),
+			('1.2.3.4.buga.xxxxx.yyy.invalid', set()),
+			('example.com', set([IPAddr('2606:2800:220:1:248:1893:25c8:1946'), IPAddr('93.184.216.34')])),
+			('www.example.com', set([IPAddr('2606:2800:220:1:248:1893:25c8:1946'), IPAddr('93.184.216.34')])),
 		):
 			c.set(*i)
+		# if fast - precache all host names as localhost addresses (speed-up getSelfIPs/ignoreself):
+		if unittest.F2B.fast: # pragma: no cover
+			for i in DNSUtils.getSelfNames():
+				c.set(i, DNSUtils.dnsToIp('localhost'))
 
 
 def mtimesleep():
@@ -320,6 +371,7 @@ def gatherTests(regexps=None, opts=None):
 	from . import sockettestcase
 	from . import misctestcase
 	from . import databasetestcase
+	from . import observertestcase
 	from . import samplestestcase
 	from . import fail2banclienttestcase
 	from . import fail2banregextestcase
@@ -350,7 +402,6 @@ def gatherTests(regexps=None, opts=None):
 		tests = FilteredTestSuite()
 
 	# Server
-	#tests.addTest(unittest.makeSuite(servertestcase.StartStop))
 	tests.addTest(unittest.makeSuite(servertestcase.Transmitter))
 	tests.addTest(unittest.makeSuite(servertestcase.JailTests))
 	tests.addTest(unittest.makeSuite(servertestcase.RegexTests))
@@ -390,6 +441,10 @@ def gatherTests(regexps=None, opts=None):
 	tests.addTest(unittest.makeSuite(misctestcase.MyTimeTest))
 	# Database
 	tests.addTest(unittest.makeSuite(databasetestcase.DatabaseTest))
+	# Observer
+	tests.addTest(unittest.makeSuite(observertestcase.ObserverTest))
+	tests.addTest(unittest.makeSuite(observertestcase.BanTimeIncr))
+	tests.addTest(unittest.makeSuite(observertestcase.BanTimeIncrDB))
 
 	# Filter
 	tests.addTest(unittest.makeSuite(filtertestcase.IgnoreIP))
@@ -473,8 +528,8 @@ def gatherTests(regexps=None, opts=None):
 # Forwards compatibility of unittest.TestCase for some early python versions
 #
 
+import difflib, pprint
 if not hasattr(unittest.TestCase, 'assertDictEqual'):
-	import difflib, pprint
 	def assertDictEqual(self, d1, d2, msg=None):
 		self.assert_(isinstance(d1, dict), 'First argument is not a dictionary')
 		self.assert_(isinstance(d2, dict), 'Second argument is not a dictionary')
@@ -486,6 +541,60 @@ if not hasattr(unittest.TestCase, 'assertDictEqual'):
 			msg = msg or (standardMsg + diff)
 			self.fail(msg)
 	unittest.TestCase.assertDictEqual = assertDictEqual
+
+def assertSortedEqual(self, a, b, level=1, nestedOnly=False, key=repr, msg=None):
+	"""Compare complex elements (like dict, list or tuple) in sorted order until
+	level 0 not reached (initial level = -1 meant all levels),
+	or if nestedOnly set to True and some of the objects still contains nested lists or dicts.
+	"""
+	# used to recognize having element as nested dict, list or tuple:
+	def _is_nested(v):
+		if isinstance(v, dict):
+			return any(isinstance(v, (dict, list, tuple)) for v in v.itervalues())
+		return any(isinstance(v, (dict, list, tuple)) for v in v)
+	if nestedOnly:
+		_nest_sorted = sorted
+	else:
+		def _nest_sorted(v, key=key):
+			if isinstance(v, (set, list, tuple)):
+				return sorted(list(_nest_sorted(v, key) for v in v), key=key)
+			return v
+	# level comparison routine:
+	def _assertSortedEqual(a, b, level, nestedOnly, key):
+		# first the lengths:
+		if len(a) != len(b):
+			raise ValueError('%r != %r' % (a, b))
+		# if not allow sorting of nested - just compare directly:
+		if not level and (nestedOnly and (not _is_nested(a) and not _is_nested(b))):
+			if a == b:
+				return
+			raise ValueError('%r != %r' % (a, b))
+		if isinstance(a, dict) and isinstance(b, dict): # compare dict's:
+			for k, v1 in a.iteritems():
+				v2 = b[k]
+				if isinstance(v1, (dict, list, tuple)) and isinstance(v2, (dict, list, tuple)):
+					_assertSortedEqual(v1, v2, level-1 if level != 0 else 0, nestedOnly, key)
+				elif v1 != v2:
+					raise ValueError('%r != %r' % (a, b))
+		else: # list, tuple, something iterable:
+			a = _nest_sorted(a, key=key)
+			b = _nest_sorted(b, key=key)
+			for v1, v2 in zip(a, b):
+				if isinstance(v1, (dict, list, tuple)) and isinstance(v2, (dict, list, tuple)):
+					_assertSortedEqual(v1, v2, level-1 if level != 0 else 0, nestedOnly, key)
+				elif v1 != v2:
+					raise ValueError('%r != %r' % (a, b))
+	# compare and produce assertion-error by exception:
+	try:
+		_assertSortedEqual(a, b, level, nestedOnly, key)
+	except Exception as e:
+		standardMsg = e.args[0] if isinstance(e, ValueError) else (str(e) + "\nwithin:")
+		diff = ('\n' + '\n'.join(difflib.ndiff(
+			pprint.pformat(a).splitlines(),
+			pprint.pformat(b).splitlines())))
+		msg = msg or (standardMsg + diff)
+		self.fail(msg)
+unittest.TestCase.assertSortedEqual = assertSortedEqual
 
 if not hasattr(unittest.TestCase, 'assertRaisesRegexp'):
 	def assertRaisesRegexp(self, exccls, regexp, fun, *args, **kwargs):
@@ -526,12 +635,21 @@ if True: ## if not hasattr(unittest.TestCase, 'assertIn'):
 _org_setUp = unittest.TestCase.setUp
 def _customSetUp(self):
 	# print('=='*10, self)
-	if unittest.F2B.log_level <= logging.DEBUG: # so if DEBUG etc -- show them (and log it in travis)!
-		print("")
+	# so if DEBUG etc -- show them (and log it in travis)!
+	if unittest.F2B.log_level <= logging.DEBUG: # pragma: no cover
+		sys.stderr.write("\n")
 		logSys.debug('='*10 + ' %s ' + '='*20, self.id())
 	_org_setUp(self)
+	if unittest.F2B.verbosity > 2: # pragma: no cover
+		self.__startTime = time.time()
+
+_org_tearDown = unittest.TestCase.tearDown
+def _customTearDown(self):
+	if unittest.F2B.verbosity > 2: # pragma: no cover
+		sys.stderr.write(" %.3fs -- " % (time.time() - self.__startTime,))
 
 unittest.TestCase.setUp = _customSetUp
+unittest.TestCase.tearDown = _customTearDown
 
 
 class LogCaptureTestCase(unittest.TestCase):
@@ -547,8 +665,10 @@ class LogCaptureTestCase(unittest.TestCase):
 
 		def __init__(self, lazy=True):
 			self._lock = threading.Lock()
-			self._val = None
+			self._val = ''
+			self._dirty = 0
 			self._recs = list()
+			self._nolckCntr = 0
 			self._strm = StringIO()
 			logging.Handler.__init__(self)
 			if lazy:
@@ -556,71 +676,95 @@ class LogCaptureTestCase(unittest.TestCase):
 			
 		def truncate(self, size=None):
 			"""Truncate the internal buffer and records."""
-			if size:
+			if size: # pragma: no cover - not implemented now
 				raise Exception('invalid size argument: %r, should be None or 0' % size)
+			self._val = ''
 			with self._lock:
-				self._strm.truncate(0)
-				self._val = None
+				self._dirty = 0
 				self._recs = list()
+				self._strm.truncate(0)
 
 		def __write(self, record):
-			msg = record.getMessage() + '\n'
 			try:
-				self._strm.write(msg)
-			except UnicodeEncodeError:
-				self._strm.write(msg.encode('UTF-8'))
+				msg = record.getMessage() + '\n'
+				try:
+					self._strm.write(msg)
+				except UnicodeEncodeError: # pragma: no cover - normally unreachable now
+					self._strm.write(msg.encode('UTF-8', 'replace'))
+			except Exception as e: # pragma: no cover - normally unreachable
+				self._strm.write('Error by logging handler: %r' % e)
 
 		def getvalue(self):
 			"""Return current buffer as whole string."""
-			with self._lock:
-				# cached:
-				if self._val is not None:
-					return self._val
-				# submit already emitted (delivered to handle) records:
-				for record in self._recs:
-					self.__write(record)
-				self._recs = list()
-				# cache and return:
-				self._val = self._strm.getvalue()
+			# if cached (still unchanged/no write operation), we don't need to enter lock:
+			if not self._dirty:
 				return self._val
+			# try to lock, if not possible - return cached/empty (max 5 times):
+			lck = self._lock.acquire(False)
+			# if records changed:
+			if self._dirty & 2:
+				if not lck: # pragma: no cover (may be too sporadic on slow systems)
+					self._nolckCntr += 1
+					if self._nolckCntr <= 5:
+						return self._val
+					self._nolckCntr = 0
+					self._lock.acquire()
+				# minimize time of lock, avoid dead-locking during cross lock within self._strm ...
+				try:
+					self._dirty &= ~3 # reset dirty records/buffer flag before cache value built
+					recs = self._recs
+					self._recs = list()
+				finally:
+					self._lock.release()
+				# submit already emitted (delivered to handle) records:
+				for record in recs:
+					self.__write(record)
+			elif lck: # pragma: no cover - too sporadic for coverage
+				# reset dirty buffer flag (if we can lock, otherwise just next time):
+				self._dirty &= ~1 # reset dirty buffer flag
+				self._lock.release()
+			# cache (outside of log to avoid dead-locking during cross lock within self._strm):
+			self._val = self._strm.getvalue()
+			# return current string value:
+			return self._val
 			 
 		def handle(self, record): # pragma: no cover
 			"""Handle the specified record direct (not lazy)"""
+			self.__write(record)
+			# string buffer changed:
 			with self._lock:
-				self._val = None
-				self.__write(record)
+				self._dirty |= 1 # buffer changed
 
 		def _handle_lazy(self, record):
 			"""Lazy handle the specified record on demand"""
 			with self._lock:
-				self._val = None
 				self._recs.append(record)
+				# logged - causes changed string buffer (signal by set _dirty):
+				self._dirty |= 2 # records changed
 
 	def setUp(self):
-
 		# For extended testing of what gets output into logging
 		# system, we will redirect it to a string
-		logSys = getLogger("fail2ban")
-
 		# Keep old settings
 		self._old_level = logSys.level
 		self._old_handlers = logSys.handlers
 		# Let's log everything into a string
 		self._log = LogCaptureTestCase._MemHandler(unittest.F2B.log_lazy)
 		logSys.handlers = [self._log]
-		if self._old_level <= logging.DEBUG:
+		# lowest log level to capture messages (expected in tests) is Lev.9
+		if self._old_level <= logging.DEBUG: # pragma: no cover
 			logSys.handlers += self._old_handlers
-		else: # lowest log level to capture messages
-			logSys.setLevel(logging.DEBUG)
+		if self._old_level > logging.DEBUG-1:
+			logSys.setLevel(logging.DEBUG-1)
 		super(LogCaptureTestCase, self).setUp()
 
 	def tearDown(self):
 		"""Call after every test case."""
 		# print "O: >>%s<<" % self._log.getvalue()
 		self.pruneLog()
-		logSys = getLogger("fail2ban")
+		self._log.close()
 		logSys.handlers = self._old_handlers
-		logSys.level = self._old_level
+		logSys.setLevel(self._old_level)
 		super(LogCaptureTestCase, self).tearDown()
 
 	def _is_logged(self, *s, **kwargs):
@@ -653,21 +797,24 @@ class LogCaptureTestCase(unittest.TestCase):
 		"""
 		wait = kwargs.get('wait', None)
 		if wait:
+			wait = unittest.F2B.maxWaitTime(wait)
 			res = Utils.wait_for(lambda: self._is_logged(*s, **kwargs), wait)
 		else:
 			res = self._is_logged(*s, **kwargs)
 		if not kwargs.get('all', False):
 			# at least one entry should be found:
-			if not res: # pragma: no cover
+			if not res:
 				logged = self._log.getvalue()
-				self.fail("None among %r was found in the log: ===\n%s===" % (s, logged))
+				self.fail("None among %r was found in the log%s: ===\n%s===" % (s, 
+					((', waited %s' % wait) if wait else ''), logged))
 		else:
 			# each entry should be found:
-			if not res: # pragma: no cover
+			if not res:
 				logged = self._log.getvalue()
 				for s_ in s:
 					if s_ not in logged:
-						self.fail("%r was not found in the log: ===\n%s===" % (s_, logged))
+						self.fail("%r was not found in the log%s: ===\n%s===" % (s_, 
+							((', waited %s' % wait) if wait else ''), logged))
 
 	def assertNotLogged(self, *s, **kwargs):
 		"""Assert that strings were not logged
@@ -680,15 +827,14 @@ class LogCaptureTestCase(unittest.TestCase):
 		all : boolean (default False) if True should fail if any of s logged
 		"""
 		logged = self._log.getvalue()
-		if not kwargs.get('all', False):
+		if len(s) > 1 and not kwargs.get('all', False):
 			for s_ in s:
 				if s_ not in logged:
 					return
-			if True: # pragma: no cover
-				self.fail("All of the %r were found present in the log: ===\n%s===" % (s, logged))
+			self.fail("All of the %r were found present in the log: ===\n%s===" % (s, logged))
 		else:
 			for s_ in s:
-				if s_ in logged: # pragma: no cover
+				if s_ in logged:
 					self.fail("%r was found in the log: ===\n%s===" % (s_, logged))
 
 	def pruneLog(self, logphase=None):
@@ -699,8 +845,15 @@ class LogCaptureTestCase(unittest.TestCase):
 	def getLog(self):
 		return self._log.getvalue()
 
-	def printLog(self):
-		print(self._log.getvalue())
+	@staticmethod
+	def dumpFile(fn, handle=logSys.debug):
+		"""Helper which outputs content of the file at HEAVYDEBUG loglevels"""
+		if (handle != logSys.debug or logSys.getEffectiveLevel() <= logging.DEBUG):
+			handle('---- ' + fn + ' ----')
+			for line in fileinput.input(fn):
+				line = line.rstrip('\n')
+				handle(line)
+			handle('-'*30)
 
 
 pid_exists = Utils.pid_exists

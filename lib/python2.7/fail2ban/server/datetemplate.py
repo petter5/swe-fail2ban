@@ -35,17 +35,24 @@ logSys = getLogger(__name__)
 # check already grouped contains "(", but ignores char "\(" and conditional "(?(id)...)":
 RE_GROUPED = re.compile(r'(?<!(?:\(\?))(?<!\\)\((?!\?)')
 RE_GROUP = ( re.compile(r'^((?:\(\?\w+\))?\^?(?:\(\?\w+\))?)(.*?)(\$?)$'), r"\1(\2)\3" )
+RE_GLOBALFLAGS = re.compile(r'((?:^|(?!<\\))\(\?[a-z]+\))')
 
+RE_EXLINE_NO_BOUNDS = re.compile(r'^\{UNB\}')
 RE_EXLINE_BOUND_BEG = re.compile(r'^\{\^LN-BEG\}')
-RE_NO_WRD_BOUND_BEG = re.compile(r'^\(*(?:\(\?\w+\))?(?:\^|\(*\*\*|\(\?:\^)')
-RE_NO_WRD_BOUND_END = re.compile(r'(?<!\\)(?:\$\)?|\*\*\)*)$')
+RE_EXSANC_BOUND_BEG = re.compile(r'^\((?:\?:)?\^\|\\b\|\\W\)')
+RE_EXEANC_BOUND_BEG = re.compile(r'\(\?=\\b\|\\W\|\$\)$')
+RE_NO_WRD_BOUND_BEG = re.compile(r'^\(*(?:\(\?\w+\))?(?:\^|\(*\*\*|\((?:\?:)?\^)')
+RE_NO_WRD_BOUND_END = re.compile(r'(?<!\\)(?:\$\)?|\\b|\\s|\*\*\)*)$')
 RE_DEL_WRD_BOUNDS = ( re.compile(r'^\(*(?:\(\?\w+\))?\(*\*\*|(?<!\\)\*\*\)*$'), 
 	                    lambda m: m.group().replace('**', '') )
 
-RE_LINE_BOUND_BEG = re.compile(r'^(?:\(\?\w+\))?(?:\^|\(\?:\^(?!\|))')
+RE_LINE_BOUND_BEG = re.compile(r'^(?:\(\?\w+\))?(?:\^|\((?:\?:)?\^(?!\|))')
 RE_LINE_BOUND_END = re.compile(r'(?<![\\\|])(?:\$\)?)$')
 
 RE_ALPHA_PATTERN = re.compile(r'(?<!\%)\%[aAbBpc]')
+
+RE_EPOCH_PATTERN = re.compile(r"(?<!\\)\{L?EPOCH\}", re.IGNORECASE)
+
 
 class DateTemplate(object):
 	"""A template which searches for and returns a date from a log line.
@@ -77,7 +84,7 @@ class DateTemplate(object):
 		return self._regex
 
 	def setRegex(self, regex, wordBegin=True, wordEnd=True):
-		"""Sets regex to use for searching for date in log line.
+		r"""Sets regex to use for searching for date in log line.
 
 		Parameters
 		----------
@@ -104,6 +111,11 @@ class DateTemplate(object):
 		# because it may be very slow in negative case (by long log-lines not matching pattern)
 
 		regex = regex.strip()
+		# cut global flags like (?iu) from RE in order to pre-set it after processing:
+		gf = RE_GLOBALFLAGS.search(regex)
+		if gf:
+			regex = RE_GLOBALFLAGS.sub('', regex, count=1)
+		# check word boundaries needed:
 		boundBegin = wordBegin and not RE_NO_WRD_BOUND_BEG.search(regex)
 		boundEnd = wordEnd and not RE_NO_WRD_BOUND_END.search(regex)
 		# if no group add it now, should always have a group(1):
@@ -114,7 +126,7 @@ class DateTemplate(object):
 		if boundBegin:
 			self.flags |= DateTemplate.WORD_BEGIN if wordBegin != 'start' else DateTemplate.LINE_BEGIN
 			if wordBegin != 'start':
-				regex = r'(?:^|\b|\W)' + regex
+				regex = r'(?=^|\b|\W)' + regex
 			else:
 				regex = r"^(?:\W{0,2})?" + regex
 				if not self.name.startswith('{^LN-BEG}'):
@@ -123,12 +135,16 @@ class DateTemplate(object):
 		if boundEnd:
 			self.flags |= DateTemplate.WORD_END
 			regex += r'(?=\b|\W|$)'
-		if RE_LINE_BOUND_BEG.search(regex): self.flags |= DateTemplate.LINE_BEGIN
-		if RE_LINE_BOUND_END.search(regex): self.flags |= DateTemplate.LINE_END
+		if not (self.flags & DateTemplate.LINE_BEGIN) and RE_LINE_BOUND_BEG.search(regex):
+			self.flags |= DateTemplate.LINE_BEGIN
+		if not (self.flags & DateTemplate.LINE_END) and RE_LINE_BOUND_END.search(regex):
+			self.flags |= DateTemplate.LINE_END
 		# remove possible special pattern "**" in front and end of regex:
 		regex = RE_DEL_WRD_BOUNDS[0].sub(RE_DEL_WRD_BOUNDS[1], regex)
+		if gf: # restore global flags:
+			regex = gf.group(1) + regex
 		self._regex = regex
-		logSys.debug('  constructed regex %s', regex)
+		logSys.log(4, '  constructed regex %s', regex)
 		self._cRegex = None
 
 	regex = property(getRegex, setRegex, doc=
@@ -151,6 +167,7 @@ class DateTemplate(object):
 		"""
 		if not self._cRegex:
 			self._compileRegex()
+		logSys.log(4, "   search %s", self.regex)
 		dateMatch = self._cRegex.search(line, *args); # pos, endpos
 		if dateMatch:
 			self.hits += 1
@@ -158,7 +175,7 @@ class DateTemplate(object):
 		return dateMatch
 
 	@abstractmethod
-	def getDate(self, line, dateMatch=None):
+	def getDate(self, line, dateMatch=None, default_tz=None):
 		"""Abstract method, which should return the date for a log line
 
 		This should return the date for a log line, typically taking the
@@ -169,6 +186,8 @@ class DateTemplate(object):
 		----------
 		line : str
 			Log line, of which the date should be extracted from.
+		default_tz: if no explicit time zone is present in the line
+                            passing this will interpret it as in that time zone.
 
 		Raises
 		------
@@ -176,6 +195,14 @@ class DateTemplate(object):
 			Abstract method, therefore always returns this.
 		"""
 		raise NotImplementedError("getDate() is abstract")
+
+	@staticmethod
+	def unboundPattern(pattern):
+		return RE_EXEANC_BOUND_BEG.sub('',
+			RE_EXSANC_BOUND_BEG.sub('',
+				RE_EXLINE_BOUND_BEG.sub('', RE_EXLINE_NO_BOUNDS.sub('', pattern))
+			)
+		)
 
 
 class DateEpoch(DateTemplate):
@@ -190,23 +217,35 @@ class DateEpoch(DateTemplate):
 	regex
 	"""
 
-	def __init__(self, lineBeginOnly=False):
+	def __init__(self, lineBeginOnly=False, pattern=None, longFrm=False):
 		DateTemplate.__init__(self)
-		self.name = "Epoch"
-		if not lineBeginOnly:
-			regex = r"((?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=\baudit\()))\d{10,11}\b(?:\.\d{3,6})?)(?:(?(selinux)(?=:\d+\)))|(?(square)(?=\])))"
+		self.name = "Epoch" if not pattern else pattern
+		self._longFrm = longFrm;
+		self._grpIdx = 1
+		epochRE = r"\d{10,11}\b(?:\.\d{3,6})?"
+		if longFrm:
+			self.name = "LongEpoch" if not pattern else pattern
+			epochRE = r"\d{10,11}(?:\d{3}(?:\.\d{1,6}|\d{3})?)?"
+		if pattern:
+			# pattern should capture/cut out the whole match:
+			regex = "(" + RE_EPOCH_PATTERN.sub(lambda v: "(%s)" % epochRE, pattern) + ")"
+			self._grpIdx = 2
+			self.setRegex(regex)
+		elif not lineBeginOnly:
+			regex = r"((?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=\baudit\()))%s)(?:(?(selinux)(?=:\d+\)))|(?(square)(?=\])))" % epochRE
 			self.setRegex(regex, wordBegin=False) ;# already line begin resp. word begin anchored
 		else:
-			regex = r"((?P<square>(?<=^\[))?\d{10,11}\b(?:\.\d{3,6})?)(?(square)(?=\]))"
+			regex = r"((?P<square>(?<=^\[))?%s)(?(square)(?=\]))" % epochRE
 			self.setRegex(regex, wordBegin='start', wordEnd=True)
 
-	def getDate(self, line, dateMatch=None):
+	def getDate(self, line, dateMatch=None, default_tz=None):
 		"""Method to return the date for a log line.
 
 		Parameters
 		----------
 		line : str
 			Log line, of which the date should be extracted from.
+		default_tz: ignored, Unix timestamps are time zone independent
 
 		Returns
 		-------
@@ -217,8 +256,14 @@ class DateEpoch(DateTemplate):
 		if not dateMatch:
 			dateMatch = self.matchDate(line)
 		if dateMatch:
+			v = dateMatch.group(self._grpIdx)
 			# extract part of format which represents seconds since epoch
-			return (float(dateMatch.group(1)), dateMatch)
+			if self._longFrm and len(v) >= 13:
+				if len(v) >= 16 and '.' not in v:
+					v = float(v) / 1000000
+				else:
+					v = float(v) / 1000
+			return (float(v), dateMatch)
 
 
 class DatePatternRegex(DateTemplate):
@@ -264,20 +309,27 @@ class DatePatternRegex(DateTemplate):
 	def setRegex(self, pattern, wordBegin=True, wordEnd=True):
 		# original pattern:
 		self._pattern = pattern
+		# if unbound signalled - reset boundaries left and right:
+		if RE_EXLINE_NO_BOUNDS.search(pattern):
+			pattern = RE_EXLINE_NO_BOUNDS.sub('', pattern)
+			wordBegin = wordEnd = False
 		# if explicit given {^LN-BEG} - remove it from pattern and set 'start' in wordBegin:
 		if wordBegin and RE_EXLINE_BOUND_BEG.search(pattern):
 			pattern = RE_EXLINE_BOUND_BEG.sub('', pattern)
 			wordBegin = 'start'
-		# wrap to regex:
-		fmt = self._patternRE.sub(r'%(\1)s', pattern)
-		self.name = fmt % self._patternName
-		regex = fmt % timeRE
-		# if expected add (?iu) for "ignore case" and "unicode":
-		if RE_ALPHA_PATTERN.search(pattern):
-			regex = r'(?iu)' + regex
-		super(DatePatternRegex, self).setRegex(regex, wordBegin, wordEnd)
+		try:
+			# wrap to regex:
+			fmt = self._patternRE.sub(r'%(\1)s', pattern)
+			self.name = fmt % self._patternName
+			regex = fmt % timeRE
+			# if expected add (?iu) for "ignore case" and "unicode":
+			if RE_ALPHA_PATTERN.search(pattern):
+				regex = r'(?iu)' + regex
+			super(DatePatternRegex, self).setRegex(regex, wordBegin, wordEnd)
+		except Exception as e:
+			raise TypeError("Failed to set datepattern '%s' (may be an invalid format or unescaped percent char): %s" % (pattern, e))
 
-	def getDate(self, line, dateMatch=None):
+	def getDate(self, line, dateMatch=None, default_tz=None):
 		"""Method to return the date for a log line.
 
 		This uses a custom version of strptime, using the named groups
@@ -287,6 +339,7 @@ class DatePatternRegex(DateTemplate):
 		----------
 		line : str
 			Log line, of which the date should be extracted from.
+		default_tz: optionally used to correct timezone
 
 		Returns
 		-------
@@ -297,7 +350,8 @@ class DatePatternRegex(DateTemplate):
 		if not dateMatch:
 			dateMatch = self.matchDate(line)
 		if dateMatch:
-			return reGroupDictStrptime(dateMatch.groupdict()), dateMatch
+			return (reGroupDictStrptime(dateMatch.groupdict(), default_tz=default_tz),
+				dateMatch)
 
 
 class DateTai64n(DateTemplate):
@@ -315,13 +369,14 @@ class DateTai64n(DateTemplate):
 		# We already know the format for TAI64N
 		self.setRegex("@[0-9a-f]{24}", wordBegin=wordBegin)
 
-	def getDate(self, line, dateMatch=None):
+	def getDate(self, line, dateMatch=None, default_tz=None):
 		"""Method to return the date for a log line.
 
 		Parameters
 		----------
 		line : str
 			Log line, of which the date should be extracted from.
+		default_tz: ignored, since TAI is time zone independent
 
 		Returns
 		-------

@@ -52,6 +52,7 @@ class SMTPActionTest(unittest.TestCase):
 
 	def setUp(self):
 		"""Call before every test case."""
+		unittest.F2B.SkipIfCfgMissing(action='smtp.py')
 		super(SMTPActionTest, self).setUp()
 		self.jail = DummyJail()
 		pythonModule = os.path.join(CONFIG_DIR, "action.d", "smtp.py")
@@ -67,7 +68,7 @@ class SMTPActionTest(unittest.TestCase):
 		port = self.smtpd.socket.getsockname()[1]
 
 		self.action = customActionModule.Action(
-			self.jail, "test", host="127.0.0.1:%i" % port)
+			self.jail, "test", host="localhost:%i" % port)
 
 		## because of bug in loop (see loop in asyncserver.py) use it's loop instead of asyncore.loop:
 		self._active = True
@@ -81,6 +82,7 @@ class SMTPActionTest(unittest.TestCase):
 		self.smtpd.close()
 		self._active = False
 		self._loop_thread.join()
+		super(SMTPActionTest, self).tearDown()
 
 	def _exec_and_wait(self, doaction, timeout=3, short=False):
 		if short: timeout /= 25
