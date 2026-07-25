@@ -269,6 +269,17 @@ why mixing the two leaves an orphaned second process running.
 
 ### Upgrading an existing install (e.g. from 0.0.3 / fail2ban 0.10.0a2)
 
+For a production box, `upgrade.sh` does all of the steps below in one
+script (stop, back up `jail.conf`, fetch, install, start, verify):
+
+```sh
+curl -fsSL -o upgrade.sh https://raw.githubusercontent.com/petter5/swe-fail2ban/master/upgrade.sh
+less upgrade.sh   # read it before running anything as root
+bash upgrade.sh
+```
+
+Or do it by hand:
+
 `enable-fail2ban` is safe to re-run over an existing install — it overwrites
 the mod's files in place and is idempotent (re-running it doesn't duplicate
 the `/etc/bashrc` addition or double-append the GREEN network). It does
