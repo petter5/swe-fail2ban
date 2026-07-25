@@ -151,6 +151,35 @@ install), and an actual ban/unban cycle surviving a real restart (Bug 5's
 fix was verified by inspection — the directory gets created — but not by
 triggering a real ban and restarting).
 
+## Smoothwall admin GUI integration
+
+`enable-fail2ban` uses Smoothwall's own drop-in mod extension points to make
+fail2ban activity visible in the stock admin UI, rather than CLI-only:
+
+- **Logs → system tab**: `fail2ban.conf`'s `logtarget` is set to `SYSLOG`
+  (instead of its own file), so ban/unban/jail-start events land in
+  `/var/log/messages` like everything else and show up in the existing
+  "system" log tab automatically — no new tab, no core file changes.
+  Confirmed on the test VM: `fail2ban.jail[PID]: INFO Jail 'apache' started`
+  etc. appear there right after `rc.fail2ban start`.
+- **Control → Services status**: registered via
+  `usr/lib/smoothwall/services/fail2ban` (Smoothwall's documented
+  "SmoothInstall" mod convention — `status.cgi` globs
+  `/var/smoothwall/mods/*/usr/lib/smoothwall/services/*`, one file per
+  service, contents `name,release`). This part is only **partially working**:
+  the file is found and would drive the PID-file-based running/uptime check
+  correctly (it matches `rc.fail2ban`'s own `/var/run/fail2ban.pid`), but the
+  display name goes through `status.cgi`'s `$tr{$name}` translation-table
+  lookup, and a matching mod-provided `usr/lib/smoothwall/langs/en.pl`
+  (confirmed to actually get `require`'d — a marker-file test proved it runs)
+  still doesn't make `$tr{fail2ban}` resolve on the test VM. Net effect: the
+  row doesn't render with a usable name yet. Not resolved — likely a Perl
+  package/scope subtlety in `header.pm` between where `%tr` is populated and
+  where `status.cgi` later reads it. If you want to pick this up: the file
+  `usr/lib/smoothwall/services/fail2ban` and
+  `usr/lib/smoothwall/langs/en.pl` are both already in place in this repo;
+  the open question is purely why the language-file merge doesn't stick.
+
 ## Installation (Smoothwall Express 3.1, Update 12 + Update 13)
 
 ### New install
