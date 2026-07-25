@@ -47,6 +47,15 @@ restore_bans() {
 	: > "${tmpfile}"
 	while IFS=',' read -r ip jail bantime bantimestamp; do
 		[ -z "${ip}" ] && continue
+		# <time> is a Python float (e.g. "1785012240.48"); bash's $(( ))
+		# can't do arithmetic on that, so drop everything from the '.' on.
+		bantimestamp="${bantimestamp%%.*}"
+		# Skip anything that isn't plain digits (defensive: a malformed
+		# line here must never abort the loop, since the unconditional
+		# mv below would then replace bans.csv with a partial tmpfile).
+		case "${bantime}${bantimestamp}" in
+			*[!0-9-]*) continue ;;
+		esac
 		if [ "${bantime}" = "-1" ] || [ $((bantimestamp + bantime)) -gt "${now}" ]; then
 			python "${FAIL2BAN_CLIENT}" -s "${SOCKET}" set "${jail}" banip "${ip}" > /dev/null 2>&1
 			echo "${ip},${jail},${bantime},${bantimestamp}" >> "${tmpfile}"
