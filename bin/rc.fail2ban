@@ -31,6 +31,30 @@ SOCKET="/var/run/fail2ban.sock"
 F2B_DB_DIR="${F2B_HOME}/var/lib/fail2ban"
 [ -d "${F2B_DB_DIR}" ] || mkdir -p "${F2B_DB_DIR}"
 
+# Smoothwall Express's bundled Python 2.7 has no _sqlite3 extension module
+# (present as .py files, but the compiled C binding is missing), so
+# fail2ban's normal sqlite-backed ban database can never work here even
+# with F2B_DB_DIR present - see README. csvlog.conf (chained onto the
+# apache/ssh-iptables jails' action) logs every ban to this CSV as a
+# workaround; restore_bans() below re-applies still-valid ones on start.
+BANS_CSV="${F2B_DB_DIR}/bans.csv"
+
+restore_bans() {
+	[ -f "${BANS_CSV}" ] || return 0
+	local now ip jail bantime bantimestamp tmpfile
+	now=$(date +%s)
+	tmpfile="${BANS_CSV}.tmp"
+	: > "${tmpfile}"
+	while IFS=',' read -r ip jail bantime bantimestamp; do
+		[ -z "${ip}" ] && continue
+		if [ "${bantime}" = "-1" ] || [ $((bantimestamp + bantime)) -gt "${now}" ]; then
+			python "${FAIL2BAN_CLIENT}" -s "${SOCKET}" set "${jail}" banip "${ip}" > /dev/null 2>&1
+			echo "${ip},${jail},${bantime},${bantimestamp}" >> "${tmpfile}"
+		fi
+	done < "${BANS_CSV}"
+	mv "${tmpfile}" "${BANS_CSV}"
+}
+
 RED="\\033[0;31m"
 DGREE="\\033[0;32m"
 DYELL="\\033[0;33m"
@@ -61,7 +85,9 @@ start() {
 	echo -e "${LRED}failed${CLEAR}"
     else
 	echo -e "${LGREE}done${CLEAR}"
-	sleep 5 && chmod 644 /var/run/fail2ban.pid &
+	sleep 2
+	restore_bans
+	sleep 3 && chmod 644 /var/run/fail2ban.pid &
     fi
 }
 
@@ -78,7 +104,9 @@ force_start() {
 	echo -e "${LRED}failed${CLEAR}"
     else
 	echo -e "${LGREE}done${CLEAR}"
-	sleep 5 && chmod 644 /var/run/fail2ban.pid &
+	sleep 2
+	restore_bans
+	sleep 3 && chmod 644 /var/run/fail2ban.pid &
     fi
 }
 
