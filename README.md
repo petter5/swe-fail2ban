@@ -29,12 +29,10 @@ on top:
   still present, unchanged, in 1.0.2's `server.py`.
 - Bug 1's apache-auth patch — **dropped**. fail2ban 1.0.2 shipped a rewritten
   `configparserinc.py` (cross-section/include interpolation, `known/` section
-  fallback) that appears to fix the exact class of bug Bug 1 worked around.
-  I couldn't get a live functional test running in this sandbox (no Python
-  2.7 available, and fail2ban's own Python 3 port has unrelated gaps), so
-  **this is the top thing to verify before relying on it** — run
-  `fail2ban-regex /var/log/httpd*/*error.log filter.d/apache-auth.conf` on a
-  real box (or VM) and confirm it reports matched failures, not zero.
+  fallback) that fixes the exact class of bug Bug 1 worked around — confirmed
+  on a real VM (see "Tested on a real VM install" below):
+  `fail2ban-regex` against a sample Apache auth-failure log line through
+  `filter.d/apache-auth.conf` reports 1 matched, 0 missed.
 - **Caught in review, not from the original issue:** upstream's new
   `jail.conf` ships `ignoreip` commented out by default
   (`#ignoreip = 127.0.0.1/8 ::1`), but `enable-fail2ban`'s installer only
@@ -111,28 +109,69 @@ the ban-restore logic itself (`Jail.restoreCurrentBans()`) works correctly.
 `mkdir -p`) before every start, so persistence no longer depends on a manual
 setup step being remembered or surviving a mod reinstall.
 
-## Untested on real hardware
+### Bug 6 — `fail2ban-client start` and `rc.fail2ban` use different sockets
 
-Everything above was verified by static review (source diffing against
-upstream, code tracing, Python syntax-checking) — there is no Smoothwall
-Express box or VM in this environment to actually install and run the mod
-on. Before publishing, install on a real Smoothwall Express 3.1 SP6 box or
-VM and confirm: the service starts, both jails (`apache`, `ssh-iptables`)
-show up in `fail2ban-client status`, the apache-auth filter actually matches
-failures (see the note above), bans survive `rc.fail2ban restart`, and the
-GREEN network shows up in `fail2ban-client get apache ignoreip`.
+fail2ban 1.0.2 changed its default `socket`/`pidfile` to
+`/var/run/fail2ban/fail2ban.sock` and `.../fail2ban.pid` (a subdirectory).
+`rc.fail2ban` has always passed its own explicit `-s`/`-p` flags
+(`/var/run/fail2ban.sock`, `/var/run/fail2ban.pid`, no subdirectory) and
+still does. Starting the server with a bare `fail2ban-client -c /etc/fail2ban
+start` (as the install docs used to say) uses the new default instead — a
+**different** socket than `rc.fail2ban` uses. Mixing the two (e.g. starting
+via the bare command, then later running `rc.fail2ban stop`/`restart` as the
+upgrade instructions do) doesn't stop the first process at all: `rc.fail2ban`
+looks for its own pidfile, doesn't find it, and starts a **second**,
+orphaned `fail2ban-server`, running alongside the first with its own
+separate ban database. Confirmed on a real VM: this produced two live
+`fail2ban-server` processes watching the same logs.
+
+**Fix:** `fail2ban.conf`'s `socket`/`pidfile` defaults changed back to
+`/var/run/fail2ban.sock` / `/var/run/fail2ban.pid`, matching what
+`rc.fail2ban` has always passed explicitly — so a bare `fail2ban-client
+start` and `rc.fail2ban start` now agree by default. Docs below still use
+`rc.fail2ban` throughout regardless, since it's also the only thing that
+gets Bug 5's directory-creation fix. If you ever do end up with two
+processes anyway (`ps aux | grep fail2ban-server`), kill the one whose
+`-s`/`-p` paths don't match `/var/run/fail2ban.sock` / `/var/run/fail2ban.pid`.
+
+## Tested on a real VM install
+
+Installed and verified end-to-end on a Smoothwall Express 3.1 SP6 + Update 13
+QEMU/KVM VM (fresh install, not an upgrade from 0.0.3): `enable-fail2ban`
+completes, both jails (`apache`, `ssh-iptables`) come up under
+`rc.fail2ban status` / `fail2ban-client status`, and — the one thing that
+couldn't be checked without a real Python 2.7 runtime — `fail2ban-regex`
+against a sample Apache auth-failure log line through `filter.d/apache-auth.conf`
+reports **1 matched, 0 missed**, confirming upstream's rewritten
+config-include interpolation does fix the class of bug Bug 1 used to work
+around. Bug 6 above was found during this same test.
+
+Not yet tested: the upgrade-from-0.0.3 path itself (this VM was a fresh
+install), and an actual ban/unban cycle surviving a real restart (Bug 5's
+fix was verified by inspection — the directory gets created — but not by
+triggering a real ban and restarting).
 
 ## Installation (Smoothwall Express 3.1, Update 12 + Update 13)
 
 ### New install
 
+Smoothwall Express doesn't ship `git`, only `perl` and `curl` — `git clone`
+will fail with "no git in ...". Fetch a release tarball instead:
+
 ```sh
 # On the Smoothwall box, as root:
 cd /tmp
-git clone https://github.com/petter5/swe-fail2ban.git fail2ban
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.4/swe-fail2ban-0.0.4.tar.gz
+tar xzf fail2ban.tar.gz
+mv swe-fail2ban-0.0.4 fail2ban
 cd fail2ban
 perl enable-fail2ban
 ```
+
+(If you're doing this from a machine that *does* have git, `git clone
+https://github.com/petter5/swe-fail2ban.git fail2ban` into `/tmp/fail2ban`
+works identically — `enable-fail2ban` just needs the directory to be named
+`fail2ban` under `/tmp`.)
 
 `enable-fail2ban` copies the mod into `/var/smoothwall/mods-available/fail2ban`,
 whitelists the GREEN network in `jail.conf`, adds `PYTHONPATH` to `/etc/bashrc`,
@@ -142,8 +181,11 @@ start it:
 ```sh
 touch /var/smoothwall/mods-available/fail2ban/config
 source /etc/bashrc
-fail2ban-client -c /etc/fail2ban start
+/var/smoothwall/mods-available/fail2ban/bin/rc.fail2ban start
 ```
+
+Use `rc.fail2ban`, not a bare `fail2ban-client start` — see Bug 6 below for
+why mixing the two leaves an orphaned second process running.
 
 ### Upgrading an existing install (e.g. from 0.0.3 / fail2ban 0.10.0a2)
 
@@ -168,10 +210,13 @@ automatically on first start with the new library — no manual DB step needed.
 #    jail.d/*.conf files are untouched and don't need backing up.
 cp /etc/fail2ban/jail.conf /root/jail.conf.bak-0.0.3   # optional but recommended
 
-# 3. Fetch and re-run the installer, same as a new install:
+# 3. Fetch and re-run the installer, same as a new install (no git on
+#    Smoothwall Express — see "New install" above):
 cd /tmp
-rm -rf fail2ban
-git clone https://github.com/petter5/swe-fail2ban.git fail2ban
+rm -rf fail2ban fail2ban.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.4/swe-fail2ban-0.0.4.tar.gz
+tar xzf fail2ban.tar.gz
+mv swe-fail2ban-0.0.4 fail2ban
 cd fail2ban
 perl enable-fail2ban
 
@@ -180,9 +225,9 @@ source /etc/bashrc
 /var/smoothwall/mods-available/fail2ban/bin/rc.fail2ban start
 
 # 5. Verify:
-fail2ban-client -c /etc/fail2ban status
-fail2ban-client -c /etc/fail2ban status apache
-fail2ban-client -c /etc/fail2ban status ssh-iptables
+/var/smoothwall/mods-available/fail2ban/bin/rc.fail2ban status
+fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status apache
+fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status ssh-iptables
 ```
 
 Confirm both jails are listed, previously-banned IPs still show up under

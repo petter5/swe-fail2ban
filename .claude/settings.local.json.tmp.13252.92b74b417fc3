@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -0 '-I{}' python3 -c ' *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(bash -n bin/rc.fail2ban)",
+      "Bash(awk '{print $1}')",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
+    ]
+  }
+}
