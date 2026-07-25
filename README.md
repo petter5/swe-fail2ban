@@ -109,6 +109,54 @@ the ban-restore logic itself (`Jail.restoreCurrentBans()`) works correctly.
 `mkdir -p`) before every start, so persistence no longer depends on a manual
 setup step being remembered or surviving a mod reinstall.
 
+**Update — the directory was never the whole story.** Testing on a real VM
+turned up something bigger: Smoothwall Express's bundled Python 2.7.2 has
+the `sqlite3` package's `.py` files but not the compiled `_sqlite3`
+extension (the C binding — `libsqlite3.so` itself **is** present and used
+by other programs, just never wired up to Python). `import sqlite3` fails
+with `ImportError: No module named _sqlite3`, so fail2ban's SQLite-backed
+ban database can't work here **at all**, directory or not. It's not fatal —
+fail2ban logs the error and keeps running, jails and live banning both work
+fine — but bans never survive any restart, full stop.
+
+There's no compiler on the box either (confirmed: no `gcc`, no `cc`), so
+building a matching `_sqlite3.so` isn't a config change, it's a whole
+separate cross-compilation project (e.g. using the SP6 dev ISO). Given
+that, worked around it instead with a plain CSV file:
+
+- `action.d/csvlog.conf` — a new action chained onto the `apache` and
+  `ssh-iptables` jails (`etc/fail2ban/jail.d/{httpd,sshd}.conf`) that
+  appends `ip,jail,bantime,timestamp` to
+  `var/lib/fail2ban/bans.csv` on every ban.
+- `rc.fail2ban`'s new `restore_bans()`, called after every successful
+  start: reads that CSV and re-applies (`fail2ban-client set <jail> banip
+  <ip>`) any entry whose `timestamp + bantime` hasn't passed yet, pruning
+  expired ones as it rewrites the file.
+
+Two bugs found and fixed getting this actually working, both confirmed via
+a real ban → restart → check-iptables cycle on the test VM:
+- fail2ban's `<time>` tag is a Python **float** (`"1785012240.48"`), which
+  bash's `$(( ))` can't do arithmetic on — crashed the restore loop, and
+  because the `mv` of the rewritten file back over `bans.csv` ran
+  unconditionally regardless, the first restart after any ban wiped the
+  CSV instead of restoring from it. Fixed by stripping everything from the
+  `.` onward before doing arithmetic, plus a digits-only guard so a future
+  bad line gets skipped rather than repeating the same failure.
+- fail2ban calls `actionunban` for every live ticket whenever a jail
+  *stops* (not just for a real admin-initiated unban), so an
+  actionunban that stripped the CSV row erased every entry on every
+  single `rc.fail2ban stop` — before the next start's `restore_bans()`
+  ever ran. Removed the CSV-stripping actionunban entirely; expiry-based
+  pruning in `restore_bans()` is what keeps the file bounded instead. The
+  tradeoff, documented in `csvlog.conf`: an IP an admin unbans early stays
+  in the CSV until its original bantime would have expired, and comes back
+  after the next restart.
+
+Confirmed end-to-end on the test VM: ban an IP → `bans.csv` gets the row →
+`rc.fail2ban stop` (row survives) → `rc.fail2ban start` → `fail2ban-client
+status apache` shows it banned again → `iptables -L f2b-apache -n` shows
+the real `REJECT` rule back in place, not just fail2ban's own bookkeeping.
+
 ### Bug 6 — `fail2ban-client start` and `rc.fail2ban` use different sockets
 
 fail2ban 1.0.2 changed its default `socket`/`pidfile` to
@@ -146,10 +194,13 @@ reports **1 matched, 0 missed**, confirming upstream's rewritten
 config-include interpolation does fix the class of bug Bug 1 used to work
 around. Bug 6 above was found during this same test.
 
+Also confirmed end-to-end on the same VM: a real ban (`fail2ban-client set
+apache banip <ip>`) surviving a full `rc.fail2ban stop` + `start` cycle,
+right down to the actual `iptables -L f2b-apache -n` rule reappearing —
+see Bug 5's update above for what that took.
+
 Not yet tested: the upgrade-from-0.0.3 path itself (this VM was a fresh
-install), and an actual ban/unban cycle surviving a real restart (Bug 5's
-fix was verified by inspection — the directory gets created — but not by
-triggering a real ban and restarting).
+install).
 
 ## Smoothwall admin GUI integration
 
@@ -190,9 +241,9 @@ will fail with "no git in ...". Fetch a release tarball instead:
 ```sh
 # On the Smoothwall box, as root:
 cd /tmp
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.4/swe-fail2ban-0.0.4.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.5/swe-fail2ban-0.0.5.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.4 fail2ban
+mv swe-fail2ban-0.0.5 fail2ban
 cd fail2ban
 perl enable-fail2ban
 ```
@@ -243,9 +294,9 @@ cp /etc/fail2ban/jail.conf /root/jail.conf.bak-0.0.3   # optional but recommende
 #    Smoothwall Express — see "New install" above):
 cd /tmp
 rm -rf fail2ban fail2ban.tar.gz
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.4/swe-fail2ban-0.0.4.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.5/swe-fail2ban-0.0.5.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.4 fail2ban
+mv swe-fail2ban-0.0.5 fail2ban
 cd fail2ban
 perl enable-fail2ban
 
@@ -260,7 +311,7 @@ fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status ssh-iptables
 ```
 
 Confirm both jails are listed, previously-banned IPs still show up under
-`status <jail>`, and the mod browser shows version `0.0.4`.
+`status <jail>`, and the mod browser shows version `0.0.5`.
 
 ## Jails configured
 
