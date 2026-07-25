@@ -1,0 +1,3 @@
+$filters{fail2ban} = '(fail2ban\.[a-z]+)\[.*\]';
+$optionText{fail2ban} = 'fail2ban';
+1;
