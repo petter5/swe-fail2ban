@@ -15,8 +15,6 @@
 #
 
 F2B_HOME="/var/smoothwall/mods-available/fail2ban"
-# Check that config is done (config file is written by config_fail2ban)
-[ -f "${F2B_HOME}/config" ] || exit 0
 
 # fail2ban 0.10.x uses separate server and client binaries.
 # Set PYTHONPATH so the bundled library is found when called from init scripts.

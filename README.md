@@ -182,6 +182,35 @@ gets Bug 5's directory-creation fix. If you ever do end up with two
 processes anyway (`ps aux | grep fail2ban-server`), kill the one whose
 `-s`/`-p` paths don't match `/var/run/fail2ban.sock` / `/var/run/fail2ban.pid`.
 
+### Bug 7 — `rc.fail2ban` silently no-ops without a dead marker file
+
+`rc.fail2ban` gated every single command (`start`, `stop`, `status`, all of
+it) on `${F2B_HOME}/config` existing, with the comment "config file is
+written by `config_fail2ban`" — but `config_fail2ban` can't actually do that
+in this fork: its own required template, `config.default`, doesn't exist
+anywhere in this repo, so it fails immediately (`"No default
+configuration-file found, exiting..."`, exit `-1`) before ever reaching the
+line that would write `config`. Nothing else reads that file's contents
+either — the jail configs hardcode their own `maxretry`/`findtime`/`bantime`
+directly. The only way it ever existed was the manual one-time `touch` this
+README used to tell "New install" users to run.
+
+Found on a real production box, not the test VM: after a stale
+`fail2ban-server` process (left over from before Bug 6's socket fix landed)
+was killed and the mod reinstalled via `upgrade.sh`, that touch-once file
+was gone. `rc.fail2ban start` then returned exit 0 with **no output and no
+process** — indistinguishable from success unless you check `ps` — silently
+leaving the box unprotected. The 7 IPs banned on `ssh-iptables` at the time
+were lost from the running server's state in the process; recovered by
+grepping `[jail] Ban`/`Unban` pairs out of the pre-Bug-6 file-based
+`fail2ban.log` for entries with no matching `Unban`, then re-applied with
+`fail2ban-client set ssh-iptables banip <ip>`.
+
+**Fix:** removed the check entirely. `rc.fail2ban` no longer depends on any
+file besides what `enable-fail2ban` itself creates. The `touch
+.../config` step is no longer part of installation (removed from the docs
+below).
+
 ## Tested on a real VM install
 
 Installed and verified end-to-end on a Smoothwall Express 3.1 SP6 + Update 13
@@ -200,7 +229,8 @@ right down to the actual `iptables -L f2b-apache -n` rule reappearing —
 see Bug 5's update above for what that took.
 
 Not yet tested: the upgrade-from-0.0.3 path itself (this VM was a fresh
-install).
+install). Bug 7 (above) was found and fixed directly on a real production
+box, not this VM — not yet re-verified here.
 
 ## Smoothwall admin GUI integration
 
@@ -241,9 +271,9 @@ will fail with "no git in ...". Fetch a release tarball instead:
 ```sh
 # On the Smoothwall box, as root:
 cd /tmp
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.5/swe-fail2ban-0.0.5.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.6/swe-fail2ban-0.0.6.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.5 fail2ban
+mv swe-fail2ban-0.0.6 fail2ban
 cd fail2ban
 perl enable-fail2ban
 ```
@@ -259,7 +289,6 @@ and symlinks the mod into `/var/smoothwall/mods` and `/etc/fail2ban`. Then
 start it:
 
 ```sh
-touch /var/smoothwall/mods-available/fail2ban/config
 source /etc/bashrc
 /var/smoothwall/mods-available/fail2ban/bin/rc.fail2ban start
 ```
@@ -305,9 +334,9 @@ cp /etc/fail2ban/jail.conf /root/jail.conf.bak-0.0.3   # optional but recommende
 #    Smoothwall Express — see "New install" above):
 cd /tmp
 rm -rf fail2ban fail2ban.tar.gz
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.5/swe-fail2ban-0.0.5.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.6/swe-fail2ban-0.0.6.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.5 fail2ban
+mv swe-fail2ban-0.0.6 fail2ban
 cd fail2ban
 perl enable-fail2ban
 
@@ -322,7 +351,7 @@ fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status ssh-iptables
 ```
 
 Confirm both jails are listed, previously-banned IPs still show up under
-`status <jail>`, and the mod browser shows version `0.0.5`.
+`status <jail>`, and the mod browser shows version `0.0.6`.
 
 ## Jails configured
 
