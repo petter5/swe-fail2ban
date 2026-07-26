@@ -14,7 +14,7 @@
 
 set -e
 
-VERSION="0.0.6"
+VERSION="0.0.7"
 MOD_HOME="/var/smoothwall/mods-available/fail2ban"
 RC="${MOD_HOME}/bin/rc.fail2ban"
 JAILS="apache ssh-iptables"
@@ -39,7 +39,7 @@ source /etc/bashrc
 
 # Capture whatever's actively banned on the OLD install before touching
 # anything. The new CSV-based ban log (etc/fail2ban/action.d/csvlog.conf)
-# only exists once 0.0.6 is running, so it has no record of bans that
+# only exists once 0.0.7 is running, so it has no record of bans that
 # predate this upgrade - without this step those would simply vanish when
 # the old service stops, restart or not.
 echo "--- Capturing currently active bans (if any) ---"

@@ -271,9 +271,9 @@ will fail with "no git in ...". Fetch a release tarball instead:
 ```sh
 # On the Smoothwall box, as root:
 cd /tmp
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.6/swe-fail2ban-0.0.6.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.7/swe-fail2ban-0.0.7.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.6 fail2ban
+mv swe-fail2ban-0.0.7 fail2ban
 cd fail2ban
 perl enable-fail2ban
 ```
@@ -334,9 +334,9 @@ cp /etc/fail2ban/jail.conf /root/jail.conf.bak-0.0.3   # optional but recommende
 #    Smoothwall Express — see "New install" above):
 cd /tmp
 rm -rf fail2ban fail2ban.tar.gz
-curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.6/swe-fail2ban-0.0.6.tar.gz
+curl -sSL -o fail2ban.tar.gz https://github.com/petter5/swe-fail2ban/releases/download/0.0.7/swe-fail2ban-0.0.7.tar.gz
 tar xzf fail2ban.tar.gz
-mv swe-fail2ban-0.0.6 fail2ban
+mv swe-fail2ban-0.0.7 fail2ban
 cd fail2ban
 perl enable-fail2ban
 
@@ -351,14 +351,17 @@ fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status ssh-iptables
 ```
 
 Confirm both jails are listed, previously-banned IPs still show up under
-`status <jail>`, and the mod browser shows version `0.0.6`.
+`status <jail>`, and the mod browser shows version `0.0.7`.
 
 ## Jails configured
 
-| Jail | Port | Log |
-|------|------|-----|
-| `apache` | 81, 441 | `/var/log/httpd*/*error.log` |
-| `ssh-iptables` | 222 | `/var/log/messages` |
+| Jail | Port | Log | maxretry |
+|------|------|-----|----------|
+| `apache` | 81, 441 | `/var/log/httpd*/*error.log` | 3 |
+| `ssh-iptables` | 222 | `/var/log/messages` | 3 |
+
+`maxretry` was tightened from the upstream default of 5 to 3 for both jails
+in 0.0.7 to ban sooner after repeated auth failures.
 
 GREEN network is automatically whitelisted during installation.
 
