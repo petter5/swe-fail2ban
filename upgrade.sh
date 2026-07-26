@@ -33,6 +33,17 @@ if [ ! -x "${RC}" ]; then
 	exit 1
 fi
 
+INSTALLED_VERSION=""
+if [ -f "${MOD_HOME}/VERSION" ]; then
+	INSTALLED_VERSION=$(sed -n 's/^MOD_VERSION=//p' "${MOD_HOME}/VERSION")
+fi
+
+if [ "${INSTALLED_VERSION}" = "${VERSION}" ]; then
+	echo "${MOD_HOME} is already on ${VERSION} - nothing to do."
+	"${RC}" status
+	exit 0
+fi
+
 # Needed for the pre-stop status query below (bin/fail2ban-client isn't on
 # PATH/PYTHONPATH until /etc/bashrc has been sourced in this shell).
 source /etc/bashrc
