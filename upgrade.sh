@@ -17,6 +17,8 @@ set -e
 VERSION="0.0.5"
 MOD_HOME="/var/smoothwall/mods-available/fail2ban"
 RC="${MOD_HOME}/bin/rc.fail2ban"
+JAILS="apache ssh-iptables"
+BANNED_FILE="$(mktemp)"
 
 echo "=== swe-fail2ban upgrade to ${VERSION} ==="
 
@@ -29,6 +31,30 @@ if [ ! -x "${RC}" ]; then
 	echo "No existing install found at ${MOD_HOME} - this script is for" >&2
 	echo "upgrades only. For a fresh install, see the README instead." >&2
 	exit 1
+fi
+
+# Needed for the pre-stop status query below (bin/fail2ban-client isn't on
+# PATH/PYTHONPATH until /etc/bashrc has been sourced in this shell).
+source /etc/bashrc
+
+# Capture whatever's actively banned on the OLD install before touching
+# anything. The new CSV-based ban log (etc/fail2ban/action.d/csvlog.conf)
+# only exists once 0.0.5 is running, so it has no record of bans that
+# predate this upgrade - without this step those would simply vanish when
+# the old service stops, restart or not.
+echo "--- Capturing currently active bans (if any) ---"
+for jail in ${JAILS}; do
+	ips=$(fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status "${jail}" 2>/dev/null \
+		| sed -n 's/.*Banned IP list:[[:space:]]*//p')
+	for ip in ${ips}; do
+		echo "${jail} ${ip}" >> "${BANNED_FILE}"
+	done
+done
+if [ -s "${BANNED_FILE}" ]; then
+	echo "Found $(wc -l < "${BANNED_FILE}") active ban(s), will restore after the upgrade:"
+	cat "${BANNED_FILE}"
+else
+	echo "No active bans found."
 fi
 
 echo "--- Stopping fail2ban ---"
@@ -58,7 +84,15 @@ echo "--- Starting fail2ban ---"
 source /etc/bashrc
 "${RC}" start
 
-echo "--- Status (verify both jails are listed before considering this done) ---"
+if [ -s "${BANNED_FILE}" ]; then
+	echo "--- Re-applying bans captured before the upgrade ---"
+	while read -r jail ip; do
+		fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock set "${jail}" banip "${ip}" >/dev/null 2>&1 || true
+	done < "${BANNED_FILE}"
+fi
+rm -f "${BANNED_FILE}"
+
+echo "--- Status (verify both jails are listed, and any bans above reappear here) ---"
 "${RC}" status
 fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status apache || true
 fail2ban-client -c /etc/fail2ban -s /var/run/fail2ban.sock status ssh-iptables || true
